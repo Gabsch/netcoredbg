@@ -158,6 +158,7 @@ public:
     bool IsStepFiltering() const override { return m_stepFiltering; }
     void SetStepFiltering(bool enable) override;
     bool IsHotReload() const override { return m_hotReload; }
+    bool IsAttachSession() const override { return m_startMethod == StartAttach; }
     HRESULT SetHotReload(bool enable) override;
 #ifdef INTEROP_DEBUGGING
     void SetInteropDebugging(bool enable) override;

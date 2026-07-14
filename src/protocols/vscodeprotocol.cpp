@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <thread>
 #include <future>
+#include <fstream>
 
 // note: order matters, vscodeprotocol.h should be included before winerror.h
 #include "protocols/vscodeprotocol.h"
@@ -53,7 +54,23 @@ namespace
         "disconnect", "terminate", "continue", "next", "stepIn", "stepOut"};
     // Don't cancel commands related to debugger configuration. For example, breakpoint setup could be done in any time (even if process don't attached at all).
     const std::unordered_set<std::string> g_debuggerSetupCommandSet{
-        "initialize", "setExceptionBreakpoints", "configurationDone", "setBreakpoints", "launch", "disconnect", "terminate", "attach", "setFunctionBreakpoints"};
+        "initialize", "setExceptionBreakpoints", "configurationDone", "setBreakpoints", "launch", "disconnect", "terminate", "attach", "setFunctionBreakpoints",
+        "visionApplyHotReload"};
+
+    constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 1;
+
+    HRESULT VisionHotReloadError(json &body, const char *code, const std::string &message, HRESULT status)
+    {
+        body["visionErrorCode"] = code;
+        body["message"] = message;
+        return status;
+    }
+
+    bool IsReadableFile(const std::string &path)
+    {
+        std::ifstream stream(path, std::ios::in | std::ios::binary);
+        return stream.good();
+    }
 } // unnamed namespace
 
 void to_json(json &j, const Source &s) {
@@ -433,6 +450,10 @@ static void AddCapabilitiesTo(json &capabilities)
     }
     capabilities["exceptionBreakpointFilters"] = excFilters;
     capabilities["supportsExceptionOptions"] = false; // TODO add implementation
+#ifdef EnC_SUPPORTED
+    capabilities["supportsVisionHotReload"] = true;
+    capabilities["visionHotReloadProtocolVersion"] = VISION_HOT_RELOAD_PROTOCOL_VERSION;
+#endif
 }
 
 void VSCodeProtocol::EmitCapabilitiesEvent()
@@ -600,6 +621,20 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         sharedDebugger->SetJustMyCode(arguments.value("justMyCode", true)); // MS vsdbg have "justMyCode" enabled by default.
         sharedDebugger->SetStepFiltering(arguments.value("enableStepFiltering", true)); // MS vsdbg have "enableStepFiltering" enabled by default.
 
+        if (arguments.value("enableHotReload", false))
+        {
+#ifdef EnC_SUPPORTED
+            HRESULT Status;
+            IfFailRet(sharedDebugger->SetHotReload(true));
+#else
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_unsupported",
+                "Vision Hot Reload is not supported by this platform build.",
+                E_NOTIMPL);
+#endif
+        }
+
         if (!fileExec.empty())
             return sharedDebugger->Launch(fileExec, execArgs, env, cwd, arguments.value("stopAtEntry", false));
 
@@ -617,6 +652,85 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
             // If we're not being asked to launch a dll, assume whatever we're given is an executable
             return sharedDebugger->Launch(program, args, env, cwd, arguments.value("stopAtEntry", false));
         }
+    } },
+    { "visionApplyHotReload", [&](const json &arguments, json &body){
+#ifndef EnC_SUPPORTED
+        return VisionHotReloadError(
+            body,
+            "vision_hot_reload_unsupported",
+            "Vision Hot Reload is not supported by this platform build.",
+            E_NOTIMPL);
+#else
+        const int protocolVersion = arguments.value("protocolVersion", 0);
+        if (protocolVersion != VISION_HOT_RELOAD_PROTOCOL_VERSION)
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_invalid_request",
+                "Unsupported Vision Hot Reload protocol version.",
+                E_INVALIDARG);
+
+        const char *required[] = {
+            "moduleName", "metadataDeltaPath", "ilDeltaPath", "pdbDeltaPath", "lineUpdatesPath"
+        };
+        for (const char *name : required)
+        {
+            auto value = arguments.find(name);
+            if (value == arguments.end() || !value->is_string() || value->get<std::string>().empty())
+                return VisionHotReloadError(
+                    body,
+                    "vision_hot_reload_invalid_request",
+                    std::string("Missing or invalid required argument '") + name + "'.",
+                    E_INVALIDARG);
+        }
+
+        if (sharedDebugger->IsAttachSession())
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_attach_unsupported",
+                "Vision Hot Reload is supported for launch sessions only.",
+                CORDBG_E_CANNOT_BE_ON_ATTACH);
+
+        if (!sharedDebugger->IsHotReload())
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_not_enabled",
+                "Vision Hot Reload was not enabled by the launch request.",
+                E_ACCESSDENIED);
+
+        const std::string metadataDelta = arguments.at("metadataDeltaPath").get<std::string>();
+        const std::string ilDelta = arguments.at("ilDeltaPath").get<std::string>();
+        const std::string pdbDelta = arguments.at("pdbDeltaPath").get<std::string>();
+        const std::string lineUpdates = arguments.at("lineUpdatesPath").get<std::string>();
+        for (const auto &path : {metadataDelta, ilDelta, pdbDelta, lineUpdates})
+        {
+            if (!IsReadableFile(path))
+                return VisionHotReloadError(
+                    body,
+                    "vision_hot_reload_invalid_request",
+                    std::string("Delta artifact is missing or unreadable: ") + path,
+                    COR_E_FILENOTFOUND);
+        }
+
+        HRESULT Status = sharedDebugger->HotReloadApplyDeltas(
+            arguments.at("moduleName").get<std::string>(),
+            metadataDelta,
+            ilDelta,
+            pdbDelta,
+            lineUpdates);
+        if (FAILED(Status))
+        {
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_apply_failed",
+                "The debugger failed to apply Hot Reload deltas. Verify the module name and delta artifacts.",
+                Status);
+        }
+
+        body["protocolVersion"] = VISION_HOT_RELOAD_PROTOCOL_VERSION;
+        body["applied"] = true;
+        body["moduleName"] = arguments.at("moduleName");
+        return S_OK;
+#endif
     } },
     { "threads", [&](const json &arguments, json &body){
         HRESULT Status;
@@ -1023,6 +1137,8 @@ void VSCodeProtocol::CommandsWorker()
                 c.response["message"] = body["message"];
 
             c.response["success"] = false;
+            if (body.find("visionErrorCode") != body.end())
+                c.response["body"] = body;
         }
 
         EmitMessageWithLog(LOG_RESPONSE, c.response);

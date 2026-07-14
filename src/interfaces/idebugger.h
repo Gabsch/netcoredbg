@@ -68,6 +68,7 @@ public:
     virtual bool IsStepFiltering() const = 0;
     virtual void SetStepFiltering(bool enable) = 0;
     virtual bool IsHotReload() const = 0;
+    virtual bool IsAttachSession() const = 0;
     virtual HRESULT SetHotReload(bool enable) = 0;
 #ifdef INTEROP_DEBUGGING
     virtual void SetInteropDebugging(bool enable) = 0;
