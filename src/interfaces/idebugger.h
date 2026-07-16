@@ -20,6 +20,53 @@ using Utility::string_view;
 class IDebugger
 {
 public:
+    enum class RewindSafety
+    {
+        Safe,
+        Unsafe,
+        Unknown
+    };
+
+    struct RewindFrameIdentity
+    {
+        std::string stopId;
+        ThreadId threadId;
+        FrameId frameId;
+        std::string moduleMvid;
+        uint32_t methodToken = 0;
+        ULONG32 functionVersion = 0;
+        ULONG32 ilOffset = 0;
+    };
+
+    struct RewindTarget
+    {
+        RewindSafety safety = RewindSafety::Unknown;
+        std::string reasonCode;
+        std::string reason;
+        HRESULT canSetIpHResult = static_cast<HRESULT>(0x80004005u);
+        RewindFrameIdentity frame;
+        std::string targetId;
+        Source source;
+        int requestedLine = 0;
+        int resolvedLine = 0;
+        int resolvedColumn = 0;
+        ULONG32 targetIlOffset = 0;
+        int expiresInMs = 0;
+    };
+
+    struct InstructionPointerResult
+    {
+        bool moved = false;
+        bool handlesInvalidated = false;
+        std::string reasonCode;
+        std::string reason;
+        HRESULT canSetIpHResult = static_cast<HRESULT>(0x80004005u);
+        HRESULT setIpHResult = static_cast<HRESULT>(0x80004005u);
+        RewindFrameIdentity previousFrame;
+        RewindFrameIdentity currentFrame;
+        StackFrame stoppedFrame;
+        std::vector<std::string> warnings;
+    };
 
     enum StepType
     {
@@ -99,6 +146,8 @@ public:
     virtual void CancelEvalRunning() = 0;
     virtual HRESULT SetVariable(const std::string &name, const std::string &value, uint32_t ref, std::string &output) = 0;
     virtual HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) = 0;
+    virtual HRESULT ResolveRewindTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line, RewindTarget &target) = 0;
+    virtual HRESULT SetInstructionPointer(const std::string &targetId, const RewindFrameIdentity &expectedFrame, InstructionPointerResult &result) = 0;
     virtual HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) = 0;
     virtual HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) = 0;
     virtual void FreeUnmanaged(PVOID mem) = 0;

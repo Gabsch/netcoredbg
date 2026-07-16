@@ -319,6 +319,7 @@ HRESULT STDMETHODCALLTYPE ManagedCallback::LoadModule(ICorDebugAppDomain *pAppDo
 
 HRESULT STDMETHODCALLTYPE ManagedCallback::UnloadModule(ICorDebugAppDomain *pAppDomain, ICorDebugModule *pModule)
 {
+    m_debugger.InvalidateRewindTargets();
     LogFuncEntry();
     return m_sharedCallbacksQueue->ContinueAppDomain(pAppDomain);
 }

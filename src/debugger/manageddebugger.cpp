@@ -7,6 +7,7 @@
 // See the LICENSE file in the project root for more information.
 
 #include <sstream>
+#include <algorithm>
 #include <mutex>
 #include <memory>
 #include <chrono>
@@ -14,6 +15,9 @@
 #include <vector>
 #include <map>
 #include <fstream>
+#include <iomanip>
+#include <random>
+#include <unordered_set>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -76,6 +80,8 @@ extern "C" const IID IID_IUnknown = { 0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0
 namespace
 {
     const auto startupWaitTimeout = std::chrono::milliseconds(5000);
+    const auto rewindTargetLifetime = std::chrono::seconds(30);
+    constexpr std::size_t maxRewindTargets = 64;
 
     const std::string envDOTNET_STARTUP_HOOKS = "DOTNET_STARTUP_HOOKS";
 #ifdef FEATURE_PAL
@@ -87,6 +93,280 @@ namespace
 #ifdef INTEROP_DEBUGGING
     const std::string envNCDB_INTEROP_DEBUGGING = "NCDB_INTEROP_DEBUGGING";
 #endif // INTEROP_DEBUGGING
+
+    std::string NewRewindTargetId()
+    {
+        std::random_device random;
+        std::ostringstream stream;
+        stream << "rewind_" << std::hex << std::setfill('0');
+        for (int i = 0; i < 4; ++i)
+            stream << std::setw(8) << random();
+        return stream.str();
+    }
+
+    bool FrameIdentityEquals(const IDebugger::RewindFrameIdentity &left, const IDebugger::RewindFrameIdentity &right)
+    {
+        return left.stopId == right.stopId &&
+            int(left.threadId) == int(right.threadId) &&
+            int(left.frameId) == int(right.frameId) &&
+            left.moduleMvid == right.moduleMvid &&
+            left.methodToken == right.methodToken &&
+            left.functionVersion == right.functionVersion &&
+            left.ilOffset == right.ilOffset;
+    }
+
+    bool HasRange(const std::vector<unsigned char> &bytes, std::size_t offset, std::size_t length)
+    {
+        return offset <= bytes.size() && length <= bytes.size() - offset;
+    }
+
+    bool ReadUInt16(const std::vector<unsigned char> &bytes, std::size_t offset, uint16_t &value)
+    {
+        if (!HasRange(bytes, offset, 2))
+            return false;
+        value = uint16_t(bytes[offset]) | (uint16_t(bytes[offset + 1]) << 8);
+        return true;
+    }
+
+    bool ReadUInt32(const std::vector<unsigned char> &bytes, std::size_t offset, uint32_t &value)
+    {
+        if (!HasRange(bytes, offset, 4))
+            return false;
+        value = uint32_t(bytes[offset]) |
+            (uint32_t(bytes[offset + 1]) << 8) |
+            (uint32_t(bytes[offset + 2]) << 16) |
+            (uint32_t(bytes[offset + 3]) << 24);
+        return true;
+    }
+
+    std::size_t Align4(std::size_t value)
+    {
+        return (value + 3u) & ~std::size_t(3u);
+    }
+
+    bool TryMapRvaToFileOffset(
+        const std::vector<unsigned char> &bytes,
+        uint32_t rva,
+        std::size_t &fileOffset)
+    {
+        uint32_t peOffset = 0;
+        if (!HasRange(bytes, 0, 0x40) ||
+            bytes[0] != 'M' ||
+            bytes[1] != 'Z' ||
+            !ReadUInt32(bytes, 0x3c, peOffset) ||
+            !HasRange(bytes, peOffset, 24) ||
+            bytes[peOffset] != 'P' ||
+            bytes[peOffset + 1] != 'E' ||
+            bytes[peOffset + 2] != 0 ||
+            bytes[peOffset + 3] != 0)
+        {
+            return false;
+        }
+
+        const std::size_t fileHeader = std::size_t(peOffset) + 4;
+        uint16_t sectionCount = 0;
+        uint16_t optionalHeaderSize = 0;
+        if (!ReadUInt16(bytes, fileHeader + 2, sectionCount) ||
+            !ReadUInt16(bytes, fileHeader + 16, optionalHeaderSize))
+        {
+            return false;
+        }
+
+        const std::size_t sectionTable = fileHeader + 20 + optionalHeaderSize;
+        for (uint16_t index = 0; index < sectionCount; ++index)
+        {
+            const std::size_t section = sectionTable + std::size_t(index) * 40;
+            uint32_t virtualSize = 0;
+            uint32_t virtualAddress = 0;
+            uint32_t rawSize = 0;
+            uint32_t rawOffset = 0;
+            if (!ReadUInt32(bytes, section + 8, virtualSize) ||
+                !ReadUInt32(bytes, section + 12, virtualAddress) ||
+                !ReadUInt32(bytes, section + 16, rawSize) ||
+                !ReadUInt32(bytes, section + 20, rawOffset))
+            {
+                return false;
+            }
+
+            const uint64_t mappedSize = std::max<uint32_t>(virtualSize, rawSize);
+            if (uint64_t(rva) < virtualAddress ||
+                uint64_t(rva) >= uint64_t(virtualAddress) + mappedSize)
+            {
+                continue;
+            }
+
+            const uint64_t resolved = uint64_t(rawOffset) + (uint64_t(rva) - virtualAddress);
+            if (resolved >= bytes.size())
+                return false;
+            fileOffset = std::size_t(resolved);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ParseSmallExceptionClause(
+        const std::vector<unsigned char> &bytes,
+        std::size_t offset,
+        CorDebugEHClause &clause)
+    {
+        uint16_t flags = 0;
+        uint16_t tryOffset = 0;
+        uint16_t handlerOffset = 0;
+        uint32_t classTokenOrFilterOffset = 0;
+        if (!ReadUInt16(bytes, offset, flags) ||
+            !ReadUInt16(bytes, offset + 2, tryOffset) ||
+            !ReadUInt16(bytes, offset + 5, handlerOffset) ||
+            !ReadUInt32(bytes, offset + 8, classTokenOrFilterOffset))
+        {
+            return false;
+        }
+
+        clause = {};
+        clause.Flags = flags;
+        clause.TryOffset = tryOffset;
+        clause.TryLength = bytes[offset + 4];
+        clause.HandlerOffset = handlerOffset;
+        clause.HandlerLength = bytes[offset + 7];
+        if ((flags & 0x00000001u) != 0)
+            clause.FilterOffset = classTokenOrFilterOffset;
+        else
+            clause.ClassToken = classTokenOrFilterOffset;
+        return true;
+    }
+
+    bool ParseFatExceptionClause(
+        const std::vector<unsigned char> &bytes,
+        std::size_t offset,
+        CorDebugEHClause &clause)
+    {
+        uint32_t classTokenOrFilterOffset = 0;
+        clause = {};
+        if (!ReadUInt32(bytes, offset, clause.Flags) ||
+            !ReadUInt32(bytes, offset + 4, clause.TryOffset) ||
+            !ReadUInt32(bytes, offset + 8, clause.TryLength) ||
+            !ReadUInt32(bytes, offset + 12, clause.HandlerOffset) ||
+            !ReadUInt32(bytes, offset + 16, clause.HandlerLength) ||
+            !ReadUInt32(bytes, offset + 20, classTokenOrFilterOffset))
+        {
+            return false;
+        }
+
+        if ((clause.Flags & 0x00000001u) != 0)
+            clause.FilterOffset = classTokenOrFilterOffset;
+        else
+            clause.ClassToken = classTokenOrFilterOffset;
+        return true;
+    }
+
+    HRESULT ReadExceptionClausesFromModule(
+        ICorDebugModule *module,
+        mdMethodDef methodToken,
+        std::vector<CorDebugEHClause> &clauses)
+    {
+        ToRelease<IUnknown> metadataUnknown;
+        HRESULT Status = module->GetMetaDataInterface(IID_IMetaDataImport, &metadataUnknown);
+        if (FAILED(Status))
+            return Status;
+
+        ToRelease<IMetaDataImport> metadata;
+        Status = metadataUnknown->QueryInterface(IID_IMetaDataImport, (LPVOID*) &metadata);
+        if (FAILED(Status))
+            return Status;
+
+        ULONG methodRva = 0;
+        DWORD implementationFlags = 0;
+        Status = metadata->GetRVA(methodToken, &methodRva, &implementationFlags);
+        if (FAILED(Status) || methodRva == 0)
+            return FAILED(Status) ? Status : E_FAIL;
+
+        const std::string modulePath = GetModuleFileName(module);
+        std::ifstream stream(modulePath, std::ios::binary | std::ios::ate);
+        if (!stream)
+            return E_FAIL;
+
+        const std::streamoff length = stream.tellg();
+        if (length <= 0)
+            return E_FAIL;
+        stream.seekg(0, std::ios::beg);
+        std::vector<unsigned char> bytes(static_cast<std::size_t>(length), 0);
+        if (!stream.read(reinterpret_cast<char*>(bytes.data()), length))
+            return E_FAIL;
+
+        std::size_t methodOffset = 0;
+        if (!TryMapRvaToFileOffset(bytes, methodRva, methodOffset) ||
+            !HasRange(bytes, methodOffset, 1))
+        {
+            return E_FAIL;
+        }
+
+        constexpr unsigned char TinyFormat = 0x02;
+        constexpr unsigned char FatFormat = 0x03;
+        constexpr uint16_t MoreSections = 0x0008;
+        const unsigned char format = bytes[methodOffset] & 0x03;
+        if (format == TinyFormat)
+            return S_OK;
+        if (format != FatFormat)
+            return E_FAIL;
+
+        uint16_t flagsAndSize = 0;
+        uint32_t codeSize = 0;
+        if (!ReadUInt16(bytes, methodOffset, flagsAndSize) ||
+            !ReadUInt32(bytes, methodOffset + 4, codeSize))
+        {
+            return E_FAIL;
+        }
+
+        const std::size_t headerSize = std::size_t((flagsAndSize >> 12) & 0x0f) * 4;
+        if (headerSize < 12 || !HasRange(bytes, methodOffset, headerSize + codeSize))
+            return E_FAIL;
+        if ((flagsAndSize & MoreSections) == 0)
+            return S_OK;
+
+        std::size_t sectionOffset = Align4(methodOffset + headerSize + codeSize);
+        bool moreSections = true;
+        while (moreSections)
+        {
+            if (!HasRange(bytes, sectionOffset, 4))
+                return E_FAIL;
+
+            const unsigned char kind = bytes[sectionOffset];
+            const bool fatSection = (kind & 0x40) != 0;
+            moreSections = (kind & 0x80) != 0;
+            const unsigned char sectionKind = kind & 0x3f;
+            const uint32_t dataSize = fatSection
+                ? uint32_t(bytes[sectionOffset + 1]) |
+                    (uint32_t(bytes[sectionOffset + 2]) << 8) |
+                    (uint32_t(bytes[sectionOffset + 3]) << 16)
+                : uint32_t(bytes[sectionOffset + 1]);
+            if (dataSize < 4 || !HasRange(bytes, sectionOffset, dataSize))
+                return E_FAIL;
+
+            if (sectionKind == 0x01)
+            {
+                const std::size_t clauseSize = fatSection ? 24 : 12;
+                if ((dataSize - 4) % clauseSize != 0)
+                    return E_FAIL;
+
+                const std::size_t clauseCount = (dataSize - 4) / clauseSize;
+                for (std::size_t index = 0; index < clauseCount; ++index)
+                {
+                    CorDebugEHClause clause;
+                    const std::size_t clauseOffset = sectionOffset + 4 + index * clauseSize;
+                    const bool parsed = fatSection
+                        ? ParseFatExceptionClause(bytes, clauseOffset, clause)
+                        : ParseSmallExceptionClause(bytes, clauseOffset, clause);
+                    if (!parsed)
+                        return E_FAIL;
+                    clauses.push_back(clause);
+                }
+            }
+
+            sectionOffset = Align4(sectionOffset + dataSize);
+        }
+
+        return S_OK;
+    }
 
     int GetSystemEnvironmentAsMap(std::map<std::string, std::string>& outMap)
     {
@@ -142,6 +422,7 @@ void ManagedDebuggerBase::NotifyProcessCreated()
 
 void ManagedDebuggerBase::NotifyProcessExited()
 {
+    InvalidateRewindTargets();
     std::unique_lock<std::mutex> lock(m_processAttachedMutex);
     m_processAttachedState = ProcessAttachedState::Unattached;
     lock.unlock();
@@ -163,17 +444,33 @@ void ManagedDebuggerBase::SetLastStoppedThread(ICorDebugThread *pThread)
 
 void ManagedDebuggerBase::SetLastStoppedThreadId(ThreadId threadId)
 {
-    std::lock_guard<std::mutex> lock(m_lastStoppedMutex);
-    m_lastStoppedThreadId = threadId;
+    {
+        std::lock_guard<std::mutex> lock(m_lastStoppedMutex);
+        m_lastStoppedThreadId = threadId;
+        ++m_stoppedEpoch;
+    }
+    InvalidateRewindTargets();
 
     std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
 
-    m_sharedBreakpoints->SetLastStoppedIlOffset(m_iCorProcess, m_lastStoppedThreadId);
+    m_sharedBreakpoints->SetLastStoppedIlOffset(m_iCorProcess, threadId);
 }
 
 void ManagedDebuggerBase::InvalidateLastStoppedThreadId()
 {
     SetLastStoppedThreadId(ThreadId::AllThreads);
+}
+
+void ManagedDebuggerBase::InvalidateRewindTargets()
+{
+    std::lock_guard<std::mutex> lock(m_rewindTargetsMutex);
+    m_rewindTargets.clear();
+}
+
+std::string ManagedDebuggerBase::CurrentStopId()
+{
+    std::lock_guard<std::mutex> lock(m_lastStoppedMutex);
+    return "stop_" + std::to_string(m_stoppedEpoch);
 }
 
 ThreadId ManagedDebugger::GetLastStoppedThreadId()
@@ -187,6 +484,7 @@ ThreadId ManagedDebugger::GetLastStoppedThreadId()
 ManagedDebuggerBase::ManagedDebuggerBase(IProtocol *pProtocol_) :
     m_processAttachedState(ProcessAttachedState::Unattached),
     m_lastStoppedThreadId(ThreadId::AllThreads),
+    m_stoppedEpoch(0),
     m_startMethod(StartNone),
     m_isConfigurationDone(false),
     pProtocol(pProtocol_),
@@ -306,6 +604,7 @@ HRESULT ManagedDebugger::ConfigurationDone()
 HRESULT ManagedDebugger::Disconnect(DisconnectAction action)
 {
     LogFuncEntry();
+    InvalidateRewindTargets();
 
     bool terminate;
     switch(action)
@@ -381,6 +680,7 @@ HRESULT ManagedDebugger::StepCommand(ThreadId threadId, StepType stepType)
     IfFailRet(m_iCorProcess->GetThread(int(threadId), &pThread));
     IfFailRet(m_uniqueSteppers->SetupStep(pThread, stepType));
 
+    InvalidateRewindTargets();
     m_sharedVariables->Clear(); // Important, must be sync with MIProtocol m_vars.clear()
     FrameId::invalidate(); // Clear all created during break frames.
     pProtocol->EmitContinuedEvent(threadId); // VSCode protocol need thread ID.
@@ -413,6 +713,7 @@ HRESULT ManagedDebugger::Continue(ThreadId threadId)
         return S_OK; // Send 'OK' response, but don't generate continue event.
     }
 
+    InvalidateRewindTargets();
     m_sharedVariables->Clear(); // Important, must be sync with MIProtocol m_vars.clear()
     FrameId::invalidate(); // Clear all created during break frames.
     pProtocol->EmitContinuedEvent(threadId); // VSCode protocol need thread ID.
@@ -1447,6 +1748,476 @@ HRESULT ManagedDebugger::SetExpression(FrameId frameId, const std::string &expre
     return m_sharedVariables->SetExpression(m_iCorProcess, frameId, expression, evalFlags, value, output);
 }
 
+HRESULT ManagedDebuggerBase::GetRewindFrameIdentity(
+    ThreadId threadId,
+    FrameId frameId,
+    IDebugger::RewindFrameIdentity &identity,
+    ToRelease<ICorDebugFrame> &frame,
+    ToRelease<ICorDebugILFrame> &ilFrame,
+    ToRelease<ICorDebugFunction> &function,
+    ToRelease<ICorDebugCode> &code,
+    ToRelease<ICorDebugModule> &module,
+    StackFrame *stackFrame)
+{
+    HRESULT Status;
+
+    if (int(frameId.getThread()) != int(threadId) || int(frameId.getLevel()) != 0)
+        return E_INVALIDARG;
+
+    {
+        std::lock_guard<std::mutex> lock(m_lastStoppedMutex);
+        if (int(m_lastStoppedThreadId) != int(threadId))
+            return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+    }
+
+    ToRelease<ICorDebugThread> thread;
+    IfFailRet(m_iCorProcess->GetThread(int(threadId), &thread));
+    IfFailRet(GetFrameAt(thread, FrameLevel(0), &frame));
+    if (!frame)
+        return E_FAIL;
+
+    IfFailRet(frame->QueryInterface(IID_ICorDebugILFrame, (LPVOID*) &ilFrame));
+    IfFailRet(frame->GetFunction(&function));
+    IfFailRet(function->GetILCode(&code));
+    IfFailRet(function->GetModule(&module));
+
+    CorDebugMappingResult mappingResult;
+    ULONG32 ilOffset = 0;
+    IfFailRet(ilFrame->GetIP(&ilOffset, &mappingResult));
+    if (mappingResult == MAPPING_UNMAPPED_ADDRESS || mappingResult == MAPPING_NO_INFO)
+        return E_FAIL;
+
+    mdMethodDef methodToken = 0;
+    ULONG32 functionVersion = 0;
+    std::string moduleMvid;
+    IfFailRet(frame->GetFunctionToken(&methodToken));
+    IfFailRet(code->GetVersionNumber(&functionVersion));
+    IfFailRet(GetModuleId(module, moduleMvid));
+
+    identity.stopId = CurrentStopId();
+    identity.threadId = threadId;
+    identity.frameId = frameId;
+    identity.moduleMvid = moduleMvid;
+    identity.methodToken = methodToken;
+    identity.functionVersion = functionVersion;
+    identity.ilOffset = ilOffset;
+
+    if (stackFrame)
+        IfFailRet(GetFrameLocation(frame, threadId, FrameLevel(0), *stackFrame, true));
+
+    return S_OK;
+}
+
+HRESULT ManagedDebuggerBase::ValidateExceptionRegions(
+    ICorDebugCode *code,
+    ICorDebugModule *module,
+    mdMethodDef methodToken,
+    ULONG32 currentIlOffset,
+    ULONG32 targetIlOffset,
+    std::string &reasonCode,
+    std::string &reason)
+{
+    HRESULT Status;
+    std::vector<CorDebugEHClause> clauses;
+    ToRelease<ICorDebugILCode> ilCode;
+    Status = code->QueryInterface(IID_ICorDebugILCode, (LPVOID*) &ilCode);
+    if (SUCCEEDED(Status))
+    {
+        ULONG32 count = 0;
+        Status = ilCode->GetEHClauses(0, &count, nullptr);
+        if (SUCCEEDED(Status) && count > 0)
+        {
+            clauses.resize(count);
+            ULONG32 written = 0;
+            Status = ilCode->GetEHClauses(count, &written, clauses.data());
+            if (SUCCEEDED(Status))
+                clauses.resize(written);
+        }
+    }
+
+    if (FAILED(Status))
+        Status = ReadExceptionClausesFromModule(module, methodToken, clauses);
+    if (FAILED(Status))
+    {
+        reasonCode = "exception_regions_unavailable";
+        reason = "The debugger could not inspect the method's exception-region metadata.";
+        return Status;
+    }
+    if (clauses.empty())
+        return S_OK;
+
+    std::vector<std::size_t> currentTryRegions;
+    std::vector<std::size_t> targetTryRegions;
+    auto InRange = [](ULONG32 offset, ULONG32 start, ULONG32 length)
+    {
+        return uint64_t(offset) >= uint64_t(start) &&
+            uint64_t(offset) < uint64_t(start) + uint64_t(length);
+    };
+
+    constexpr ULONG32 FilterClause = 0x00000001;
+    for (std::size_t index = 0; index < clauses.size(); ++index)
+    {
+        const auto &clause = clauses[index];
+        const bool currentInHandler = InRange(currentIlOffset, clause.HandlerOffset, clause.HandlerLength);
+        const bool targetInHandler = InRange(targetIlOffset, clause.HandlerOffset, clause.HandlerLength);
+        const bool currentInFilter = (clause.Flags & FilterClause) != 0 &&
+            currentIlOffset >= clause.FilterOffset && currentIlOffset < clause.HandlerOffset;
+        const bool targetInFilter = (clause.Flags & FilterClause) != 0 &&
+            targetIlOffset >= clause.FilterOffset && targetIlOffset < clause.HandlerOffset;
+
+        if (currentInHandler || targetInHandler || currentInFilter || targetInFilter)
+        {
+            reasonCode = "exception_handler_transition";
+            reason = "Instruction rewind is not allowed from or into an exception handler, filter, finally, or fault region.";
+            return S_FALSE;
+        }
+
+        if (InRange(currentIlOffset, clause.TryOffset, clause.TryLength))
+            currentTryRegions.push_back(index);
+        if (InRange(targetIlOffset, clause.TryOffset, clause.TryLength))
+            targetTryRegions.push_back(index);
+    }
+
+    if (currentTryRegions != targetTryRegions)
+    {
+        reasonCode = "exception_region_transition";
+        reason = "Instruction rewind cannot cross a protected exception region boundary.";
+        return S_FALSE;
+    }
+
+    return S_OK;
+}
+
+HRESULT ManagedDebugger::ResolveRewindTarget(
+    ThreadId threadId,
+    FrameId frameId,
+    const std::string &sourceFile,
+    int line,
+    RewindTarget &target)
+{
+    LogFuncEntry();
+
+    if (sourceFile.empty() || line <= 0)
+        return E_INVALIDARG;
+
+    std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
+    HRESULT Status;
+    IfFailRet(CheckDebugProcess());
+
+    if (m_sharedEvalWaiter->IsEvalRunning() || m_sharedCallbacksQueue->IsRunning())
+        return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+
+    ToRelease<ICorDebugFrame> frame;
+    ToRelease<ICorDebugILFrame> ilFrame;
+    ToRelease<ICorDebugFunction> function;
+    ToRelease<ICorDebugCode> code;
+    ToRelease<ICorDebugModule> module;
+    IfFailRet(GetRewindFrameIdentity(threadId, frameId, target.frame, frame, ilFrame, function, code, module));
+
+    ULONG32 currentVersion = 0;
+    IfFailRet(function->GetCurrentVersionNumber(&currentVersion));
+    if (currentVersion != target.frame.functionVersion)
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "stale_method_version";
+        target.reason = "The active frame is executing an older method version; source rewind resolution is deferred to code-edit-plus-rewind.";
+        return S_OK;
+    }
+
+    CORDB_ADDRESS moduleAddress = 0;
+    IfFailRet(module->GetBaseAddress(&moduleAddress));
+
+    unsigned sourcePathIndex = 0;
+    std::vector<ModulesSources::resolved_bp_t> resolvedPoints;
+    Status = m_sharedModules->ResolveBreakpoint(moduleAddress, sourceFile, sourcePathIndex, line, resolvedPoints);
+    if (FAILED(Status))
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "source_not_resolved";
+        target.reason = "The requested source file or line could not be resolved using the active module symbols.";
+        return S_OK;
+    }
+
+    const ModulesSources::resolved_bp_t *resolved = nullptr;
+    bool resolvedOtherMethod = false;
+    for (const auto &candidate : resolvedPoints)
+    {
+        if (candidate.startLine > line || candidate.endLine < line)
+            continue;
+        if (candidate.methodToken != target.frame.methodToken)
+        {
+            resolvedOtherMethod = true;
+            continue;
+        }
+
+        std::string candidateMvid;
+        if (FAILED(GetModuleId(candidate.iCorModule, candidateMvid)) || candidateMvid != target.frame.moduleMvid)
+            continue;
+        resolved = &candidate;
+        break;
+    }
+
+    if (!resolved)
+    {
+        target.safety = resolvedOtherMethod ? RewindSafety::Unsafe : RewindSafety::Unknown;
+        target.reasonCode = resolvedOtherMethod ? "same_method_required" : "sequence_point_not_found";
+        target.reason = resolvedOtherMethod
+            ? "The requested source line resolves outside the active method."
+            : "No executable sequence point on the requested line belongs to the active method.";
+        return S_OK;
+    }
+
+    target.requestedLine = line;
+    target.resolvedLine = resolved->startLine;
+    target.targetIlOffset = resolved->ilOffset;
+    std::string resolvedPath;
+    if (SUCCEEDED(m_sharedModules->GetSourceFullPathByIndex(sourcePathIndex, resolvedPath)))
+        target.source = Source(resolvedPath);
+    else
+        target.source = Source(sourceFile);
+
+    Modules::SequencePoint sequencePoint;
+    if (SUCCEEDED(m_sharedModules->GetSequencePointByILOffset(
+        moduleAddress,
+        target.frame.methodToken,
+        target.frame.functionVersion,
+        target.targetIlOffset,
+        sequencePoint)))
+    {
+        target.resolvedLine = sequencePoint.startLine;
+        target.resolvedColumn = sequencePoint.startColumn;
+        target.source = Source(sequencePoint.document);
+    }
+
+    if (target.targetIlOffset >= target.frame.ilOffset)
+    {
+        target.safety = RewindSafety::Unsafe;
+        target.reasonCode = target.targetIlOffset == target.frame.ilOffset ? "rewind_noop" : "forward_movement_rejected";
+        target.reason = target.targetIlOffset == target.frame.ilOffset
+            ? "The requested source line is the current instruction location."
+            : "Vision instruction control accepts backward movement only.";
+        return S_OK;
+    }
+
+    Status = ValidateExceptionRegions(
+        code,
+        module,
+        target.frame.methodToken,
+        target.frame.ilOffset,
+        target.targetIlOffset,
+        target.reasonCode,
+        target.reason);
+    if (Status == S_FALSE)
+    {
+        target.safety = RewindSafety::Unsafe;
+        return S_OK;
+    }
+    if (FAILED(Status))
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "exception_regions_unavailable";
+        target.reason = "The debugger could not verify exception-region safety for the requested movement.";
+        return S_OK;
+    }
+
+    target.canSetIpHResult = ilFrame->CanSetIP(target.targetIlOffset);
+    if (target.canSetIpHResult != S_OK)
+    {
+        target.safety = RewindSafety::Unsafe;
+        target.reasonCode = "runtime_rejected_target";
+        target.reason = "ICorDebugILFrame::CanSetIP rejected the requested instruction location.";
+        return S_OK;
+    }
+
+    target.safety = RewindSafety::Safe;
+    target.reasonCode = "safe";
+    target.reason = "The target is a backward sequence point in the same method and passed all safety checks.";
+    target.targetId = NewRewindTargetId();
+    target.expiresInMs = int(std::chrono::duration_cast<std::chrono::milliseconds>(rewindTargetLifetime).count());
+
+    const auto now = std::chrono::steady_clock::now();
+    StoredRewindTarget stored;
+    stored.id = target.targetId;
+    stored.frame = target.frame;
+    stored.sourceFile = target.source.path;
+    stored.resolvedLine = target.resolvedLine;
+    stored.resolvedColumn = target.resolvedColumn;
+    stored.targetIlOffset = target.targetIlOffset;
+    stored.createdAt = now;
+    stored.expiresAt = now + rewindTargetLifetime;
+
+    std::lock_guard<std::mutex> lock(m_rewindTargetsMutex);
+    for (auto it = m_rewindTargets.begin(); it != m_rewindTargets.end();)
+    {
+        if (it->second.expiresAt <= now)
+            it = m_rewindTargets.erase(it);
+        else
+            ++it;
+    }
+    if (m_rewindTargets.size() >= maxRewindTargets)
+    {
+        auto oldest = std::min_element(
+            m_rewindTargets.begin(),
+            m_rewindTargets.end(),
+            [](const std::pair<const std::string, StoredRewindTarget> &left,
+               const std::pair<const std::string, StoredRewindTarget> &right)
+            {
+                return left.second.createdAt < right.second.createdAt;
+            });
+        if (oldest != m_rewindTargets.end())
+            m_rewindTargets.erase(oldest);
+    }
+    m_rewindTargets.emplace(stored.id, std::move(stored));
+    return S_OK;
+}
+
+HRESULT ManagedDebugger::SetInstructionPointer(
+    const std::string &targetId,
+    const RewindFrameIdentity &expectedFrame,
+    InstructionPointerResult &result)
+{
+    LogFuncEntry();
+
+    if (targetId.empty())
+        return E_INVALIDARG;
+
+    std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
+    HRESULT Status;
+    IfFailRet(CheckDebugProcess());
+
+    if (m_sharedEvalWaiter->IsEvalRunning() || m_sharedCallbacksQueue->IsRunning())
+    {
+        result.reasonCode = "debuggee_not_stopped";
+        result.reason = "The debuggee must be stopped before moving the instruction pointer.";
+        return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+    }
+
+    StoredRewindTarget stored;
+    {
+        std::lock_guard<std::mutex> lock(m_rewindTargetsMutex);
+        auto found = m_rewindTargets.find(targetId);
+        if (found == m_rewindTargets.end())
+        {
+            result.reasonCode = "rewind_target_not_found";
+            result.reason = "The rewind target does not exist or was invalidated by a debug-state transition.";
+            return E_INVALIDARG;
+        }
+        stored = found->second;
+        m_rewindTargets.erase(found);
+    }
+
+    if (stored.expiresAt <= std::chrono::steady_clock::now())
+    {
+        result.reasonCode = "rewind_target_expired";
+        result.reason = "The rewind target expired before it was applied.";
+        return E_INVALIDARG;
+    }
+
+    if (!FrameIdentityEquals(stored.frame, expectedFrame))
+    {
+        result.reasonCode = "rewind_frame_mismatch";
+        result.reason = "The expected frame identity does not match the resolved rewind target.";
+        return E_INVALIDARG;
+    }
+
+    ToRelease<ICorDebugFrame> frame;
+    ToRelease<ICorDebugILFrame> ilFrame;
+    ToRelease<ICorDebugFunction> function;
+    ToRelease<ICorDebugCode> code;
+    ToRelease<ICorDebugModule> module;
+    IfFailRet(GetRewindFrameIdentity(
+        expectedFrame.threadId,
+        expectedFrame.frameId,
+        result.previousFrame,
+        frame,
+        ilFrame,
+        function,
+        code,
+        module));
+
+    if (!FrameIdentityEquals(result.previousFrame, expectedFrame))
+    {
+        result.reasonCode = "rewind_target_stale";
+        result.reason = "The stopped frame changed after the rewind target was resolved.";
+        return E_INVALIDARG;
+    }
+
+    Status = ValidateExceptionRegions(
+        code,
+        module,
+        result.previousFrame.methodToken,
+        result.previousFrame.ilOffset,
+        stored.targetIlOffset,
+        result.reasonCode,
+        result.reason);
+    if (Status != S_OK)
+    {
+        if (result.reasonCode.empty())
+        {
+            result.reasonCode = "rewind_safety_unknown";
+            result.reason = "The debugger could not revalidate exception-region safety.";
+        }
+        return FAILED(Status) ? Status : E_ACCESSDENIED;
+    }
+
+    result.canSetIpHResult = ilFrame->CanSetIP(stored.targetIlOffset);
+    if (result.canSetIpHResult != S_OK)
+    {
+        result.reasonCode = "runtime_rejected_target";
+        result.reason = "ICorDebugILFrame::CanSetIP rejected the target during final validation.";
+        return E_ACCESSDENIED;
+    }
+
+    result.setIpHResult = ilFrame->SetIP(stored.targetIlOffset);
+    if (result.setIpHResult != S_OK)
+    {
+        result.reasonCode = "set_ip_failed";
+        result.reason = "ICorDebugILFrame::SetIP failed.";
+        return result.setIpHResult;
+    }
+
+    result.moved = true;
+    result.handlesInvalidated = true;
+    m_sharedVariables->Clear();
+    FrameId::invalidate();
+    {
+        std::lock_guard<std::mutex> lock(m_lastStoppedMutex);
+        ++m_stoppedEpoch;
+    }
+    InvalidateRewindTargets();
+    m_sharedBreakpoints->SetLastStoppedIlOffset(m_iCorProcess, expectedFrame.threadId);
+
+    const FrameId newFrameId(expectedFrame.threadId, FrameLevel(0));
+    ToRelease<ICorDebugFrame> newFrame;
+    ToRelease<ICorDebugILFrame> newIlFrame;
+    ToRelease<ICorDebugFunction> newFunction;
+    ToRelease<ICorDebugCode> newCode;
+    ToRelease<ICorDebugModule> newModule;
+    Status = GetRewindFrameIdentity(
+        expectedFrame.threadId,
+        newFrameId,
+        result.currentFrame,
+        newFrame,
+        newIlFrame,
+        newFunction,
+        newCode,
+        newModule,
+        &result.stoppedFrame);
+    if (FAILED(Status))
+    {
+        result.warnings.emplace_back("The instruction pointer moved, but the debugger could not reacquire complete frame evidence.");
+        return S_OK;
+    }
+
+    if (result.currentFrame.moduleMvid != result.previousFrame.moduleMvid ||
+        result.currentFrame.methodToken != result.previousFrame.methodToken)
+    {
+        result.warnings.emplace_back("The instruction pointer moved, but the reacquired frame identity no longer matches the original method.");
+    }
+
+    return S_OK;
+}
+
 
 void ManagedDebugger::FindFileNames(string_view pattern, unsigned limit, SearchCallback cb)
 {
@@ -1689,6 +2460,7 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
                                               const std::string &deltaPDB, const std::string &lineUpdates)
 {
     LogFuncEntry();
+    InvalidateRewindTargets();
 
     std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
 

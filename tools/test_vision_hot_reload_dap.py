@@ -40,9 +40,12 @@ def read_response(process, request_sequence):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: test_vision_hot_reload_dap.py <netcoredbg>")
+    if len(sys.argv) != 3:
+        raise SystemExit(
+            "usage: test_vision_hot_reload_dap.py <netcoredbg> <supports-hot-reload>"
+        )
 
+    supports_hot_reload = sys.argv[2].lower() == "true"
     process = subprocess.Popen(
         [sys.argv[1], "--interpreter=vscode"],
         stdin=subprocess.PIPE,
@@ -65,13 +68,45 @@ def main():
         initialize = read_response(process, 1)
         assert initialize["success"] is True, initialize
         capabilities = initialize["body"]
-        assert capabilities.get("supportsVisionHotReload") is True, capabilities
-        assert capabilities.get("visionHotReloadProtocolVersion") == 1, capabilities
+        assert (
+            capabilities.get("supportsVisionHotReload") is True
+        ) == supports_hot_reload, capabilities
+        if supports_hot_reload:
+            assert capabilities.get("visionHotReloadProtocolVersion") == 1, capabilities
+        else:
+            assert "visionHotReloadProtocolVersion" not in capabilities, capabilities
+        assert capabilities.get("supportsVisionInstructionPointerControl") is True, capabilities
+        assert capabilities.get("visionInstructionPointerProtocolVersion") == 1, capabilities
 
         write_message(process, 2, "visionApplyHotReload", {"protocolVersion": 1})
         malformed = read_response(process, 2)
         assert malformed["success"] is False, malformed
-        assert malformed["body"]["visionErrorCode"] == "vision_hot_reload_invalid_request", malformed
+        assert malformed["body"]["visionErrorCode"] == (
+            "vision_hot_reload_invalid_request"
+            if supports_hot_reload
+            else "vision_hot_reload_unsupported"
+        ), malformed
+
+        write_message(process, 3, "visionResolveRewindTarget", {"protocolVersion": 1})
+        malformed_resolve = read_response(process, 3)
+        assert malformed_resolve["success"] is False, malformed_resolve
+        assert (
+            malformed_resolve["body"]["visionErrorCode"]
+            == "vision_instruction_control_invalid_request"
+        ), malformed_resolve
+
+        write_message(
+            process,
+            4,
+            "visionSetInstructionPointer",
+            {"protocolVersion": 1, "rewindTargetId": "missing"},
+        )
+        malformed_set = read_response(process, 4)
+        assert malformed_set["success"] is False, malformed_set
+        assert (
+            malformed_set["body"]["visionErrorCode"]
+            == "vision_instruction_control_invalid_request"
+        ), malformed_set
     finally:
         process.kill()
         process.wait(timeout=10)

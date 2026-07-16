@@ -9,6 +9,8 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <chrono>
+#include <unordered_map>
 #include "interfaces/idebugger.h"
 #include "debugger/dbgshim.h"
 #include "debugger/interop_debugging.h"
@@ -67,10 +69,28 @@ protected:
 
     std::mutex m_lastStoppedMutex;
     ThreadId m_lastStoppedThreadId;
+    uint64_t m_stoppedEpoch;
+
+    struct StoredRewindTarget
+    {
+        std::string id;
+        IDebugger::RewindFrameIdentity frame;
+        std::string sourceFile;
+        int resolvedLine = 0;
+        int resolvedColumn = 0;
+        ULONG32 targetIlOffset = 0;
+        std::chrono::steady_clock::time_point expiresAt;
+        std::chrono::steady_clock::time_point createdAt;
+    };
+
+    std::mutex m_rewindTargetsMutex;
+    std::unordered_map<std::string, StoredRewindTarget> m_rewindTargets;
 
     void SetLastStoppedThread(ICorDebugThread *pThread);
     void SetLastStoppedThreadId(ThreadId threadId);
     void InvalidateLastStoppedThreadId();
+    void InvalidateRewindTargets();
+    std::string CurrentStopId();
 
     StartMethod m_startMethod;
     std::string m_execPath;
@@ -122,6 +142,18 @@ protected:
     HRESULT GetFrameLocation(ICorDebugFrame *pFrame, ThreadId threadId, FrameLevel level, StackFrame &stackFrame, bool hotReloadAwareCaller = false);
     HRESULT GetManagedStackTrace(ICorDebugThread *pThread, ThreadId threadId, FrameLevel startFrame, unsigned maxFrames,
                                  std::vector<StackFrame> &stackFrames, int &totalFrames, bool hotReloadAwareCaller);
+    HRESULT GetRewindFrameIdentity(ThreadId threadId, FrameId frameId, IDebugger::RewindFrameIdentity &identity,
+                                   ToRelease<ICorDebugFrame> &frame, ToRelease<ICorDebugILFrame> &ilFrame,
+                                   ToRelease<ICorDebugFunction> &function, ToRelease<ICorDebugCode> &code,
+                                   ToRelease<ICorDebugModule> &module, StackFrame *stackFrame = nullptr);
+    HRESULT ValidateExceptionRegions(
+        ICorDebugCode *code,
+        ICorDebugModule *module,
+        mdMethodDef methodToken,
+        ULONG32 currentIlOffset,
+        ULONG32 targetIlOffset,
+        std::string &reasonCode,
+        std::string &reason);
 #ifdef INTEROP_DEBUGGING
     HRESULT GetNativeStackTrace(ThreadId threadId, FrameLevel startFrame, unsigned maxFrames, std::vector<StackFrame> &stackFrames, int &totalFrames);
 #endif // INTEROP_DEBUGGING
@@ -192,6 +224,8 @@ public:
     void CancelEvalRunning() override;
     HRESULT SetVariable(const std::string &name, const std::string &value, uint32_t ref, std::string &output) override;
     HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) override;
+    HRESULT ResolveRewindTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line, RewindTarget &target) override;
+    HRESULT SetInstructionPointer(const std::string &targetId, const RewindFrameIdentity &expectedFrame, InstructionPointerResult &result) override;
     HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) override;
     HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) override;
     void FreeUnmanaged(PVOID mem) override;

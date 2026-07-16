@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <limits>
 #include <thread>
 #include <future>
 #include <fstream>
@@ -58,12 +59,98 @@ namespace
         "visionApplyHotReload"};
 
     constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 1;
+    constexpr int VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION = 1;
 
     HRESULT VisionHotReloadError(json &body, const char *code, const std::string &message, HRESULT status)
     {
         body["visionErrorCode"] = code;
         body["message"] = message;
         return status;
+    }
+
+    HRESULT VisionInstructionControlError(json &body, const std::string &code, const std::string &message, HRESULT status)
+    {
+        body["visionErrorCode"] = code;
+        body["message"] = message;
+        std::ostringstream hresult;
+        hresult << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << uint32_t(status);
+        body["hresult"] = hresult.str();
+        return status;
+    }
+
+    std::string HResultText(HRESULT status)
+    {
+        std::ostringstream hresult;
+        hresult << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << uint32_t(status);
+        return hresult.str();
+    }
+
+    const char *RewindSafetyText(IDebugger::RewindSafety safety)
+    {
+        switch (safety)
+        {
+            case IDebugger::RewindSafety::Safe:
+                return "safe";
+            case IDebugger::RewindSafety::Unsafe:
+                return "unsafe";
+            default:
+                return "unknown";
+        }
+    }
+
+    json FrameIdentityJson(const IDebugger::RewindFrameIdentity &identity)
+    {
+        return json{
+            {"stopId", identity.stopId},
+            {"threadId", int(identity.threadId)},
+            {"frameId", int(identity.frameId)},
+            {"moduleMvid", identity.moduleMvid},
+            {"methodToken", identity.methodToken},
+            {"functionVersion", identity.functionVersion},
+            {"ilOffset", identity.ilOffset}};
+    }
+
+    bool TryParseFrameIdentity(const json &value, IDebugger::RewindFrameIdentity &identity)
+    {
+        if (!value.is_object())
+            return false;
+
+        const char *stringFields[] = {"stopId", "moduleMvid"};
+        const char *integerFields[] = {"threadId", "frameId", "methodToken", "functionVersion", "ilOffset"};
+        for (const char *name : stringFields)
+        {
+            auto field = value.find(name);
+            if (field == value.end() || !field->is_string() || field->get<std::string>().empty())
+                return false;
+        }
+        for (const char *name : integerFields)
+        {
+            auto field = value.find(name);
+            if (field == value.end() || !field->is_number_integer())
+                return false;
+        }
+
+        const int threadId = value.at("threadId").get<int>();
+        const int frameId = value.at("frameId").get<int>();
+        const int64_t methodToken = value.at("methodToken").get<int64_t>();
+        const int64_t functionVersion = value.at("functionVersion").get<int64_t>();
+        const int64_t ilOffset = value.at("ilOffset").get<int64_t>();
+        if (threadId <= 0 || frameId < 0 ||
+            methodToken <= 0 || methodToken > std::numeric_limits<uint32_t>::max() ||
+            functionVersion <= 0 || functionVersion > std::numeric_limits<ULONG32>::max() ||
+            ilOffset < 0 || ilOffset > std::numeric_limits<ULONG32>::max())
+        {
+            return false;
+        }
+
+        identity.stopId = value.at("stopId").get<std::string>();
+        identity.threadId = ThreadId(threadId);
+        identity.frameId = FrameId(frameId);
+        identity.moduleMvid = value.at("moduleMvid").get<std::string>();
+        identity.methodToken = uint32_t(methodToken);
+        identity.functionVersion = ULONG32(functionVersion);
+        identity.ilOffset = ULONG32(ilOffset);
+        return true;
     }
 
     bool IsReadableFile(const std::string &path)
@@ -438,6 +525,8 @@ static void AddCapabilitiesTo(json &capabilities)
     capabilities["supportsSetExpression"] = true;
     capabilities["supportsTerminateRequest"] = true;
     capabilities["supportsCancelRequest"] = true;
+    capabilities["supportsVisionInstructionPointerControl"] = true;
+    capabilities["visionInstructionPointerProtocolVersion"] = VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION;
 
     capabilities["supportsExceptionInfoRequest"] = true;
     capabilities["supportsExceptionFilterOptions"] = true;
@@ -731,6 +820,118 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         body["moduleName"] = arguments.at("moduleName");
         return S_OK;
 #endif
+    } },
+    { "visionResolveRewindTarget", [&](const json &arguments, json &body){
+        const int protocolVersion = arguments.value("protocolVersion", 0);
+        if (protocolVersion != VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION)
+            return VisionInstructionControlError(
+                body,
+                "vision_instruction_control_invalid_request",
+                "Unsupported Vision instruction pointer protocol version.",
+                E_INVALIDARG);
+
+        auto sourceFile = arguments.find("sourceFile");
+        auto threadId = arguments.find("threadId");
+        auto frameId = arguments.find("frameId");
+        auto line = arguments.find("line");
+        if (sourceFile == arguments.end() || !sourceFile->is_string() || sourceFile->get<std::string>().empty() ||
+            threadId == arguments.end() || !threadId->is_number_integer() ||
+            frameId == arguments.end() || !frameId->is_number_integer() ||
+            line == arguments.end() || !line->is_number_integer() ||
+            threadId->get<int>() <= 0 || frameId->get<int>() < 0 || line->get<int>() <= 0)
+        {
+            return VisionInstructionControlError(
+                body,
+                "vision_instruction_control_invalid_request",
+                "Required arguments are protocolVersion, threadId, frameId, sourceFile, and line.",
+                E_INVALIDARG);
+        }
+
+        IDebugger::RewindTarget target;
+        HRESULT Status = sharedDebugger->ResolveRewindTarget(
+            ThreadId(threadId->get<int>()),
+            FrameId(frameId->get<int>()),
+            sourceFile->get<std::string>(),
+            line->get<int>(),
+            target);
+        if (FAILED(Status))
+        {
+            const bool notStopped = Status == CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+            return VisionInstructionControlError(
+                body,
+                notStopped ? "vision_instruction_control_not_stopped" : "vision_instruction_control_resolve_failed",
+                notStopped
+                    ? "The debuggee must be stopped on the requested top managed frame."
+                    : "The debugger could not inspect the requested frame.",
+                Status);
+        }
+
+        body["protocolVersion"] = VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION;
+        body["status"] = RewindSafetyText(target.safety);
+        body["reasonCode"] = target.reasonCode;
+        body["reason"] = target.reason;
+        body["canSetIpHResult"] = HResultText(target.canSetIpHResult);
+        body["frameIdentity"] = FrameIdentityJson(target.frame);
+        body["targetId"] = target.targetId.empty() ? json(nullptr) : json(target.targetId);
+        body["requestedLine"] = target.requestedLine;
+        body["resolvedLine"] = target.resolvedLine > 0 ? json(target.resolvedLine) : json(nullptr);
+        body["resolvedColumn"] = target.resolvedColumn > 0 ? json(target.resolvedColumn) : json(nullptr);
+        body["targetIlOffset"] = target.targetIlOffset;
+        body["expiresInMs"] = target.expiresInMs > 0 ? json(target.expiresInMs) : json(nullptr);
+        body["source"] = target.source.IsNull() ? json(nullptr) : json(target.source);
+        return S_OK;
+    } },
+    { "visionSetInstructionPointer", [&](const json &arguments, json &body){
+        const int protocolVersion = arguments.value("protocolVersion", 0);
+        if (protocolVersion != VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION)
+            return VisionInstructionControlError(
+                body,
+                "vision_instruction_control_invalid_request",
+                "Unsupported Vision instruction pointer protocol version.",
+                E_INVALIDARG);
+
+        auto targetId = arguments.find("rewindTargetId");
+        auto expectedFrame = arguments.find("expectedFrameIdentity");
+        IDebugger::RewindFrameIdentity identity;
+        if (targetId == arguments.end() || !targetId->is_string() || targetId->get<std::string>().empty() ||
+            expectedFrame == arguments.end() || !TryParseFrameIdentity(*expectedFrame, identity))
+        {
+            return VisionInstructionControlError(
+                body,
+                "vision_instruction_control_invalid_request",
+                "Required arguments are protocolVersion, rewindTargetId, and a complete expectedFrameIdentity.",
+                E_INVALIDARG);
+        }
+
+        IDebugger::InstructionPointerResult result;
+        HRESULT Status = sharedDebugger->SetInstructionPointer(targetId->get<std::string>(), identity, result);
+        if (FAILED(Status))
+        {
+            return VisionInstructionControlError(
+                body,
+                result.reasonCode.empty() ? "vision_instruction_control_set_failed" : result.reasonCode,
+                result.reason.empty() ? "The debugger refused to move the instruction pointer." : result.reason,
+                Status);
+        }
+
+        body["protocolVersion"] = VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION;
+        body["moved"] = result.moved;
+        body["handlesInvalidated"] = result.handlesInvalidated;
+        body["canSetIpHResult"] = HResultText(result.canSetIpHResult);
+        body["setIpHResult"] = HResultText(result.setIpHResult);
+        body["previousFrameIdentity"] = FrameIdentityJson(result.previousFrame);
+        if (!result.currentFrame.stopId.empty())
+        {
+            body["frameIdentity"] = FrameIdentityJson(result.currentFrame);
+            body["stoppedFrame"] = result.stoppedFrame;
+        }
+        else
+        {
+            body["frameIdentity"] = nullptr;
+            body["stoppedFrame"] = nullptr;
+        }
+        body["warnings"] = result.warnings;
+        return S_OK;
     } },
     { "threads", [&](const json &arguments, json &body){
         HRESULT Status;
