@@ -136,6 +136,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view "${{ github.ref_name }}" >/dev/null 2>&1 ||
             gh release create "${{ github.ref_name }}" --verify-tag --generate-notes
