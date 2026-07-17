@@ -2235,6 +2235,7 @@ HRESULT ManagedDebuggerBase::GetInvocationId(
     const IDebugger::RewindFrameIdentity &identity,
     std::string &invocationId)
 {
+    HRESULT Status;
     (void)thread;
     CORDB_ADDRESS activeStart = 0;
     CORDB_ADDRESS activeEnd = 0;
@@ -2263,6 +2264,7 @@ HRESULT ManagedDebugger::InspectFrameGeneration(
     FrameId frameId,
     FrameGenerationEvidence &evidence)
 {
+    HRESULT Status;
     std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
     IfFailRet(CheckDebugProcess());
     if (m_sharedEvalWaiter->IsEvalRunning() || m_sharedCallbacksQueue->IsRunning())
@@ -2291,6 +2293,7 @@ HRESULT ManagedDebugger::ResolveActiveFrameRemapTarget(
     ULONG32 appliedGeneration,
     ActiveFrameRemapTarget &target)
 {
+    HRESULT Status;
     LogFuncEntry();
     if (sourceFile.empty() || line <= 0 || moduleMvid.empty() || methodToken == 0 || appliedGeneration <= 1)
         return E_INVALIDARG;
@@ -2328,7 +2331,7 @@ HRESULT ManagedDebugger::ResolveActiveFrameRemapTarget(
     IfFailRet(module->GetBaseAddress(&moduleAddress));
     unsigned sourcePathIndex = 0;
     std::vector<ModulesSources::resolved_bp_t> resolvedPoints;
-    HRESULT Status = m_sharedModules->ResolveBreakpoint(moduleAddress, sourceFile, sourcePathIndex, line, resolvedPoints);
+    Status = m_sharedModules->ResolveBreakpoint(moduleAddress, sourceFile, sourcePathIndex, line, resolvedPoints);
     if (FAILED(Status))
     {
         target.safety = RewindSafety::Unknown;
@@ -2408,6 +2411,7 @@ HRESULT ManagedDebuggerBase::TryApplyArmedActiveFrameRemap(
     ICorDebugFunction *newFunction,
     ULONG32 oldIlOffset)
 {
+    HRESULT Status;
     (void)oldIlOffset;
     StoredActiveFrameRemapTarget target;
     {
@@ -2747,7 +2751,11 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
         ULONG32 previousGeneration = 0;
         IfFailRet(module->GetFunctionFromToken(token, &function));
         IfFailRet(function->GetCurrentVersionNumber(&previousGeneration));
-        methodGenerations.push_back({token, previousGeneration, 0});
+        HotReloadMethodGeneration generation;
+        generation.methodToken = token;
+        generation.previousGeneration = previousGeneration;
+        generation.appliedGeneration = 0;
+        methodGenerations.push_back(generation);
     }
 
     IfFailRet(ApplyMetadataAndILDeltas(m_sharedModules.get(), dllFileName, deltaMD, deltaIL));
