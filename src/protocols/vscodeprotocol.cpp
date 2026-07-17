@@ -66,6 +66,9 @@ namespace
     {
         body["visionErrorCode"] = code;
         body["message"] = message;
+        std::ostringstream hresult;
+        hresult << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << uint32_t(status);
+        body["hresult"] = hresult.str();
         return status;
     }
 
@@ -840,6 +843,7 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         }
 
         std::vector<IDebugger::HotReloadMethodGeneration> methodGenerations;
+        std::string failureStage;
         HRESULT Status = sharedDebugger->HotReloadApplyDeltas(
             arguments.at("moduleName").get<std::string>(),
             arguments.at("moduleMvid").get<std::string>(),
@@ -848,14 +852,17 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
             ilDelta,
             pdbDelta,
             lineUpdates,
-            methodGenerations);
+            methodGenerations,
+            failureStage);
         if (FAILED(Status))
         {
-            return VisionHotReloadError(
+            HRESULT error = VisionHotReloadError(
                 body,
                 "vision_hot_reload_apply_failed",
                 "The debugger failed to apply Hot Reload deltas. Verify the module name and delta artifacts.",
                 Status);
+            body["stage"] = failureStage.empty() ? "unknown" : failureStage;
+            return error;
         }
 
         body["protocolVersion"] = VISION_HOT_RELOAD_PROTOCOL_VERSION;

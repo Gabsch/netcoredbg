@@ -261,7 +261,8 @@ public:
                                  const std::vector<uint32_t> &updatedMethodTokens,
                                  const std::string &deltaMD, const std::string &deltaIL,
                                  const std::string &deltaPDB, const std::string &lineUpdates,
-                                 std::vector<HotReloadMethodGeneration> &methodGenerations) override;
+                                 std::vector<HotReloadMethodGeneration> &methodGenerations,
+                                 std::string &failureStage) override;
     HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,
                                  const std::string &deltaPDB, const std::string &lineUpdates) override;
 

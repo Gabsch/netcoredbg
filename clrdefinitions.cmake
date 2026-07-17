@@ -1,5 +1,9 @@
 include(clrfeatures.cmake)
 
+option(VISION_ENABLE_EXPERIMENTAL_LINUX_ENC
+  "Compile the unreleased Vision Linux x64 Edit-and-Continue feasibility probe"
+  OFF)
+
 # If set, indicates that this is not an officially supported release
 # Keep in sync with IsPrerelease in dir.props
 set(PRERELEASE 1)
@@ -107,6 +111,10 @@ if(WIN32)
     # exclude Linux, arm & arm64
     add_definitions(-DEnC_SUPPORTED)
   endif(CLR_CMAKE_TARGET_ARCH_AMD64 OR CLR_CMAKE_TARGET_ARCH_I386)
+elseif(CLR_CMAKE_PLATFORM_LINUX AND CLR_CMAKE_TARGET_ARCH_AMD64 AND VISION_ENABLE_EXPERIMENTAL_LINUX_ENC)
+  # Research gate only. Production Linux artifacts must not enable this until
+  # the complete Vision apply, line-update, and active-frame-remap proof passes.
+  add_definitions(-DEnC_SUPPORTED)
 endif(WIN32)
 
 # Features - please keep them alphabetically sorted

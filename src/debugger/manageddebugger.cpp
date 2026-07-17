@@ -2721,9 +2721,11 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
                                               const std::vector<uint32_t> &updatedMethodTokens,
                                               const std::string &deltaMD, const std::string &deltaIL,
                                               const std::string &deltaPDB, const std::string &lineUpdates,
-                                              std::vector<HotReloadMethodGeneration> &methodGenerations)
+                                              std::vector<HotReloadMethodGeneration> &methodGenerations,
+                                              std::string &failureStage)
 {
     LogFuncEntry();
+    failureStage = "initialize";
     InvalidateRewindTargets();
     InvalidateActiveFrameRemapTargets();
 
@@ -2734,17 +2736,21 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
 
     // Deltas can be applied only on stopped debuggee process. For Hot Reload scenario we temporary stop it and continue after deltas applied.
     HRESULT Status;
+    failureStage = "stop_process";
     IfFailRet(m_sharedCallbacksQueue->Stop(m_iCorProcess));
     bool continueProcess = (Status == S_OK); // Was stopped by m_sharedCallbacksQueue->Stop() call.
 
     ToRelease<ICorDebugModule> module;
+    failureStage = "resolve_module";
     IfFailRet(m_sharedModules->GetModuleWithName(dllFileName, &module, true));
     std::string actualMvid;
+    failureStage = "read_module_mvid";
     IfFailRet(GetModuleId(module, actualMvid));
     if (!moduleMvid.empty() && actualMvid != moduleMvid)
         return E_INVALIDARG;
 
     methodGenerations.clear();
+    failureStage = "read_previous_generation";
     for (uint32_t token : updatedMethodTokens)
     {
         ToRelease<ICorDebugFunction> function;
@@ -2758,7 +2764,9 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
         methodGenerations.push_back(generation);
     }
 
+    failureStage = "apply_metadata_il";
     IfFailRet(ApplyMetadataAndILDeltas(m_sharedModules.get(), dllFileName, deltaMD, deltaIL));
+    failureStage = "read_applied_generation";
     for (auto &generation : methodGenerations)
     {
         ToRelease<ICorDebugFunction> function;
@@ -2769,8 +2777,10 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
     }
     std::string updatedDLL;
     std::unordered_set<mdTypeDef> updatedTypeTokens;
+    failureStage = "apply_pdb_line_updates";
     IfFailRet(ApplyPdbDeltaAndLineUpdates(dllFileName, deltaPDB, lineUpdates, updatedDLL, updatedTypeTokens));
 
+    failureStage = "notify_metadata_update_handlers";
     ToRelease<ICorDebugThread> pThread;
     if (SUCCEEDED(FindEvalCapableThread(pThread)))
         IfFailRet(HotReloadHelpers::UpdateApplication(pThread, m_sharedModules.get(), m_sharedEvaluator.get(), m_sharedEvalHelpers.get(), updatedDLL, updatedTypeTokens));
@@ -2778,8 +2788,12 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
         IfFailRet(m_sharedBreakpoints->SetHotReloadBreakpoint(updatedDLL, updatedTypeTokens));
 
     if (continueProcess)
+    {
+        failureStage = "continue_process";
         IfFailRet(m_sharedCallbacksQueue->Continue(m_iCorProcess));
+    }
 
+    failureStage.clear();
     return S_OK;
 }
 
@@ -2791,6 +2805,7 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(
     const std::string &lineUpdates)
 {
     std::vector<HotReloadMethodGeneration> methodGenerations;
+    std::string failureStage;
     return HotReloadApplyDeltas(
         dllFileName,
         std::string(),
@@ -2799,7 +2814,8 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(
         deltaIL,
         deltaPDB,
         lineUpdates,
-        methodGenerations);
+        methodGenerations,
+        failureStage);
 }
 
 } // namespace netcoredbg
