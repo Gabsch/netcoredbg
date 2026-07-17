@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - "vision/instruction-control-v1"
+      - "vision/active-frame-remap-v1"
     tags:
       - "vision-*"
 
@@ -89,8 +89,9 @@ jobs:
           Fork commit: $env:GITHUB_SHA
           Upstream tag: 3.2.0-1092
           Upstream commit: 9744e1f051866215611b8440c638042aa2aa2f72
-          Vision Hot Reload DAP protocol: 1
+          Vision Hot Reload DAP protocol: 2
           Vision Instruction Pointer DAP protocol: 1
+          Vision Active Frame Remap DAP protocol: 1
           "@ | Set-Content payload/VISION-PROVENANCE.txt -Encoding utf8
           Compress-Archive -Path payload/* -DestinationPath vision-netcoredbg-win-x64.zip
           (Get-FileHash vision-netcoredbg-win-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant() |
@@ -108,6 +109,7 @@ jobs:
           Upstream commit: 9744e1f051866215611b8440c638042aa2aa2f72
           Vision Hot Reload DAP protocol: unavailable
           Vision Instruction Pointer DAP protocol: 1
+          Vision Active Frame Remap DAP protocol: unavailable
           EOF
           tar -C payload -czf vision-netcoredbg-linux-x64.tar.gz .
           sha256sum vision-netcoredbg-linux-x64.tar.gz | cut -d ' ' -f 1 > vision-netcoredbg-linux-x64.tar.gz.sha256

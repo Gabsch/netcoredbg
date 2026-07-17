@@ -58,8 +58,9 @@ namespace
         "initialize", "setExceptionBreakpoints", "configurationDone", "setBreakpoints", "launch", "disconnect", "terminate", "attach", "setFunctionBreakpoints",
         "visionApplyHotReload"};
 
-    constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 1;
+    constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 2;
     constexpr int VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION = 1;
+    constexpr int VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION = 1;
 
     HRESULT VisionHotReloadError(json &body, const char *code, const std::string &message, HRESULT status)
     {
@@ -305,6 +306,23 @@ void VSCodeProtocol::EmitStoppedEvent(const StoppedEvent &event)
     EmitEvent("stopped", body);
 }
 
+void VSCodeProtocol::EmitVisionActiveFrameRemappedEvent(const ActiveFrameRemapEvent &event)
+{
+    json body = {
+        {"protocolVersion", VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION},
+        {"targetId", event.targetId},
+        {"invocationId", event.invocationId},
+        {"moduleMvid", event.moduleMvid},
+        {"methodToken", event.methodToken},
+        {"oldFunctionVersion", event.oldFunctionVersion},
+        {"newFunctionVersion", event.newFunctionVersion},
+        {"targetIlOffset", event.targetIlOffset},
+        {"source", event.source.IsNull() ? json(nullptr) : json(event.source)},
+        {"line", event.line}
+    };
+    EmitEvent("visionActiveFrameRemapped", body);
+}
+
 void VSCodeProtocol::EmitExitedEvent(const ExitedEvent &event)
 {
     LogFuncEntry();
@@ -527,6 +545,10 @@ static void AddCapabilitiesTo(json &capabilities)
     capabilities["supportsCancelRequest"] = true;
     capabilities["supportsVisionInstructionPointerControl"] = true;
     capabilities["visionInstructionPointerProtocolVersion"] = VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION;
+#ifdef EnC_SUPPORTED
+    capabilities["supportsVisionActiveFrameRemap"] = true;
+    capabilities["visionActiveFrameRemapProtocolVersion"] = VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION;
+#endif
 
     capabilities["supportsExceptionInfoRequest"] = true;
     capabilities["supportsExceptionFilterOptions"] = true;
@@ -759,7 +781,7 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
                 E_INVALIDARG);
 
         const char *required[] = {
-            "moduleName", "metadataDeltaPath", "ilDeltaPath", "pdbDeltaPath", "lineUpdatesPath"
+            "moduleName", "moduleMvid", "metadataDeltaPath", "ilDeltaPath", "pdbDeltaPath", "lineUpdatesPath"
         };
         for (const char *name : required)
         {
@@ -790,6 +812,23 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         const std::string ilDelta = arguments.at("ilDeltaPath").get<std::string>();
         const std::string pdbDelta = arguments.at("pdbDeltaPath").get<std::string>();
         const std::string lineUpdates = arguments.at("lineUpdatesPath").get<std::string>();
+        auto updatedMethods = arguments.find("updatedMethodTokens");
+        if (updatedMethods == arguments.end() || !updatedMethods->is_array() || updatedMethods->empty())
+            return VisionHotReloadError(
+                body,
+                "vision_hot_reload_invalid_request",
+                "updatedMethodTokens must contain at least one MethodDef token.",
+                E_INVALIDARG);
+        std::vector<uint32_t> updatedMethodTokens;
+        for (const auto &token : *updatedMethods)
+        {
+            if (!token.is_number_unsigned() && !token.is_number_integer())
+                return VisionHotReloadError(body, "vision_hot_reload_invalid_request", "updatedMethodTokens contains an invalid token.", E_INVALIDARG);
+            const int64_t value = token.get<int64_t>();
+            if (value <= 0 || value > std::numeric_limits<uint32_t>::max())
+                return VisionHotReloadError(body, "vision_hot_reload_invalid_request", "updatedMethodTokens contains an invalid token.", E_INVALIDARG);
+            updatedMethodTokens.push_back(uint32_t(value));
+        }
         for (const auto &path : {metadataDelta, ilDelta, pdbDelta, lineUpdates})
         {
             if (!IsReadableFile(path))
@@ -800,12 +839,16 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
                     COR_E_FILENOTFOUND);
         }
 
+        std::vector<IDebugger::HotReloadMethodGeneration> methodGenerations;
         HRESULT Status = sharedDebugger->HotReloadApplyDeltas(
             arguments.at("moduleName").get<std::string>(),
+            arguments.at("moduleMvid").get<std::string>(),
+            updatedMethodTokens,
             metadataDelta,
             ilDelta,
             pdbDelta,
-            lineUpdates);
+            lineUpdates,
+            methodGenerations);
         if (FAILED(Status))
         {
             return VisionHotReloadError(
@@ -818,8 +861,83 @@ static HRESULT HandleCommand(std::shared_ptr<IDebugger> &sharedDebugger, std::st
         body["protocolVersion"] = VISION_HOT_RELOAD_PROTOCOL_VERSION;
         body["applied"] = true;
         body["moduleName"] = arguments.at("moduleName");
+        body["moduleMvid"] = arguments.at("moduleMvid");
+        body["methodGenerations"] = json::array();
+        for (const auto &generation : methodGenerations)
+        {
+            body["methodGenerations"].push_back({
+                {"methodToken", generation.methodToken},
+                {"previousGeneration", generation.previousGeneration},
+                {"appliedGeneration", generation.appliedGeneration}
+            });
+        }
         return S_OK;
 #endif
+    } },
+    { "visionInspectFrameGeneration", [&](const json &arguments, json &body){
+        if (arguments.value("protocolVersion", 0) != VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION)
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "Unsupported active-frame remap protocol version.", E_INVALIDARG);
+        const int threadId = arguments.value("threadId", 0);
+        const int frameId = arguments.value("frameId", -1);
+        if (threadId <= 0 || frameId < 0)
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "threadId and frameId are required.", E_INVALIDARG);
+        IDebugger::FrameGenerationEvidence evidence;
+        HRESULT Status = sharedDebugger->InspectFrameGeneration(ThreadId(threadId), FrameId(frameId), evidence);
+        if (FAILED(Status))
+            return VisionInstructionControlError(body, "vision_active_frame_inspection_failed", "The active frame generation could not be inspected.", Status);
+        body["protocolVersion"] = VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION;
+        body["frameIdentity"] = FrameIdentityJson(evidence.frame);
+        body["latestGeneration"] = evidence.latestGeneration;
+        body["invocationId"] = evidence.invocationId;
+        return S_OK;
+    } },
+    { "visionResolveActiveFrameRemapTarget", [&](const json &arguments, json &body){
+        if (arguments.value("protocolVersion", 0) != VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION)
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "Unsupported active-frame remap protocol version.", E_INVALIDARG);
+        const int threadId = arguments.value("threadId", 0);
+        const int frameId = arguments.value("frameId", -1);
+        const int line = arguments.value("line", 0);
+        const int64_t methodToken = arguments.value("methodToken", int64_t(0));
+        const int64_t appliedGeneration = arguments.value("appliedGeneration", int64_t(0));
+        const std::string sourceFile = arguments.value("sourceFile", std::string());
+        const std::string moduleMvid = arguments.value("moduleMvid", std::string());
+        if (threadId <= 0 || frameId < 0 || line <= 0 || methodToken <= 0 || appliedGeneration <= 1 || sourceFile.empty() || moduleMvid.empty())
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "A complete active-frame remap target is required.", E_INVALIDARG);
+        IDebugger::ActiveFrameRemapTarget target;
+        HRESULT Status = sharedDebugger->ResolveActiveFrameRemapTarget(
+            ThreadId(threadId), FrameId(frameId), sourceFile, line, moduleMvid,
+            uint32_t(methodToken), ULONG32(appliedGeneration), target);
+        if (FAILED(Status))
+            return VisionInstructionControlError(body, "vision_active_frame_remap_resolve_failed", "The updated frame target could not be resolved.", Status);
+        body["protocolVersion"] = VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION;
+        body["status"] = RewindSafetyText(target.safety);
+        body["reasonCode"] = target.reasonCode;
+        body["reason"] = target.reason;
+        body["frameIdentity"] = FrameIdentityJson(target.frame);
+        body["targetId"] = target.targetId.empty() ? json(nullptr) : json(target.targetId);
+        body["targetIlOffset"] = target.targetIlOffset;
+        body["resolvedLine"] = target.resolvedLine > 0 ? json(target.resolvedLine) : json(nullptr);
+        body["source"] = target.source.IsNull() ? json(nullptr) : json(target.source);
+        body["appliedGeneration"] = target.appliedGeneration;
+        body["invocationId"] = target.invocationId;
+        return S_OK;
+    } },
+    { "visionArmActiveFrameRemap", [&](const json &arguments, json &body){
+        if (arguments.value("protocolVersion", 0) != VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION)
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "Unsupported active-frame remap protocol version.", E_INVALIDARG);
+        auto targetId = arguments.find("targetId");
+        auto expectedFrame = arguments.find("expectedFrameIdentity");
+        IDebugger::RewindFrameIdentity identity;
+        if (targetId == arguments.end() || !targetId->is_string() || targetId->get<std::string>().empty() ||
+            expectedFrame == arguments.end() || !TryParseFrameIdentity(*expectedFrame, identity))
+            return VisionInstructionControlError(body, "vision_active_frame_remap_invalid_request", "targetId and expectedFrameIdentity are required.", E_INVALIDARG);
+        HRESULT Status = sharedDebugger->ArmActiveFrameRemap(targetId->get<std::string>(), identity);
+        if (FAILED(Status))
+            return VisionInstructionControlError(body, "vision_active_frame_remap_arm_failed", "The remap target is missing, expired, or stale.", Status);
+        body["protocolVersion"] = VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION;
+        body["armed"] = true;
+        body["targetId"] = *targetId;
+        return S_OK;
     } },
     { "visionResolveRewindTarget", [&](const json &arguments, json &body){
         const int protocolVersion = arguments.value("protocolVersion", 0);

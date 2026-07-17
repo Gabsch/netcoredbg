@@ -86,10 +86,30 @@ protected:
     std::mutex m_rewindTargetsMutex;
     std::unordered_map<std::string, StoredRewindTarget> m_rewindTargets;
 
+    struct StoredActiveFrameRemapTarget
+    {
+        std::string id;
+        IDebugger::RewindFrameIdentity frame;
+        std::string sourceFile;
+        int resolvedLine = 0;
+        int resolvedColumn = 0;
+        ULONG32 targetIlOffset = 0;
+        ULONG32 appliedGeneration = 0;
+        std::string invocationId;
+        std::chrono::steady_clock::time_point expiresAt;
+    };
+
+    std::mutex m_activeFrameRemapMutex;
+    std::unordered_map<std::string, StoredActiveFrameRemapTarget> m_activeFrameRemapTargets;
+    std::string m_armedActiveFrameRemapId;
+    ActiveFrameRemapEvent m_lastActiveFrameRemapEvent;
+    bool m_haveActiveFrameRemapEvent = false;
+
     void SetLastStoppedThread(ICorDebugThread *pThread);
     void SetLastStoppedThreadId(ThreadId threadId);
     void InvalidateLastStoppedThreadId();
     void InvalidateRewindTargets();
+    void InvalidateActiveFrameRemapTargets();
     std::string CurrentStopId();
 
     StartMethod m_startMethod;
@@ -154,6 +174,9 @@ protected:
         ULONG32 targetIlOffset,
         std::string &reasonCode,
         std::string &reason);
+    HRESULT GetInvocationId(ICorDebugThread *thread, ICorDebugFrame *frame, const IDebugger::RewindFrameIdentity &identity, std::string &invocationId);
+    HRESULT TryApplyArmedActiveFrameRemap(ICorDebugThread *thread, ICorDebugFunction *oldFunction, ICorDebugFunction *newFunction, ULONG32 oldIlOffset);
+    bool TakeActiveFrameRemapEvent(ActiveFrameRemapEvent &event);
 #ifdef INTEROP_DEBUGGING
     HRESULT GetNativeStackTrace(ThreadId threadId, FrameLevel startFrame, unsigned maxFrames, std::vector<StackFrame> &stackFrames, int &totalFrames);
 #endif // INTEROP_DEBUGGING
@@ -226,9 +249,19 @@ public:
     HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) override;
     HRESULT ResolveRewindTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line, RewindTarget &target) override;
     HRESULT SetInstructionPointer(const std::string &targetId, const RewindFrameIdentity &expectedFrame, InstructionPointerResult &result) override;
+    HRESULT InspectFrameGeneration(ThreadId threadId, FrameId frameId, FrameGenerationEvidence &evidence) override;
+    HRESULT ResolveActiveFrameRemapTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line,
+                                          const std::string &moduleMvid, uint32_t methodToken,
+                                          ULONG32 appliedGeneration, ActiveFrameRemapTarget &target) override;
+    HRESULT ArmActiveFrameRemap(const std::string &targetId, const RewindFrameIdentity &expectedFrame) override;
     HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) override;
     HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) override;
     void FreeUnmanaged(PVOID mem) override;
+    HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &moduleMvid,
+                                 const std::vector<uint32_t> &updatedMethodTokens,
+                                 const std::string &deltaMD, const std::string &deltaIL,
+                                 const std::string &deltaPDB, const std::string &lineUpdates,
+                                 std::vector<HotReloadMethodGeneration> &methodGenerations) override;
     HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,
                                  const std::string &deltaPDB, const std::string &lineUpdates) override;
 

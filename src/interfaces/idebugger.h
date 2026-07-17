@@ -68,6 +68,26 @@ public:
         std::vector<std::string> warnings;
     };
 
+    struct HotReloadMethodGeneration
+    {
+        uint32_t methodToken = 0;
+        ULONG32 previousGeneration = 0;
+        ULONG32 appliedGeneration = 0;
+    };
+
+    struct FrameGenerationEvidence
+    {
+        RewindFrameIdentity frame;
+        ULONG32 latestGeneration = 0;
+        std::string invocationId;
+    };
+
+    struct ActiveFrameRemapTarget : RewindTarget
+    {
+        ULONG32 appliedGeneration = 0;
+        std::string invocationId;
+    };
+
     enum StepType
     {
         STEP_IN = 0,
@@ -148,9 +168,19 @@ public:
     virtual HRESULT SetExpression(FrameId frameId, const std::string &expression, int evalFlags, const std::string &value, std::string &output) = 0;
     virtual HRESULT ResolveRewindTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line, RewindTarget &target) = 0;
     virtual HRESULT SetInstructionPointer(const std::string &targetId, const RewindFrameIdentity &expectedFrame, InstructionPointerResult &result) = 0;
+    virtual HRESULT InspectFrameGeneration(ThreadId threadId, FrameId frameId, FrameGenerationEvidence &evidence) = 0;
+    virtual HRESULT ResolveActiveFrameRemapTarget(ThreadId threadId, FrameId frameId, const std::string &sourceFile, int line,
+                                                   const std::string &moduleMvid, uint32_t methodToken,
+                                                   ULONG32 appliedGeneration, ActiveFrameRemapTarget &target) = 0;
+    virtual HRESULT ArmActiveFrameRemap(const std::string &targetId, const RewindFrameIdentity &expectedFrame) = 0;
     virtual HRESULT GetExceptionInfo(ThreadId threadId, ExceptionInfo &exceptionInfo) = 0;
     virtual HRESULT GetSourceFile(const std::string &sourcePath, char** fileBuf, int* fileLen) = 0;
     virtual void FreeUnmanaged(PVOID mem) = 0;
+    virtual HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &moduleMvid,
+                                         const std::vector<uint32_t> &updatedMethodTokens,
+                                         const std::string &deltaMD, const std::string &deltaIL,
+                                         const std::string &deltaPDB, const std::string &lineUpdates,
+                                         std::vector<HotReloadMethodGeneration> &methodGenerations) = 0;
     virtual HRESULT HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,
                                          const std::string &deltaPDB, const std::string &lineUpdates) = 0;
     typedef std::function<void(const char *)> SearchCallback;

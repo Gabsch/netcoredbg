@@ -320,6 +320,7 @@ HRESULT STDMETHODCALLTYPE ManagedCallback::LoadModule(ICorDebugAppDomain *pAppDo
 HRESULT STDMETHODCALLTYPE ManagedCallback::UnloadModule(ICorDebugAppDomain *pAppDomain, ICorDebugModule *pModule)
 {
     m_debugger.InvalidateRewindTargets();
+    m_debugger.InvalidateActiveFrameRemapTargets();
     LogFuncEntry();
     return m_sharedCallbacksQueue->ContinueAppDomain(pAppDomain);
 }
@@ -441,7 +442,28 @@ HRESULT STDMETHODCALLTYPE ManagedCallback::FunctionRemapOpportunity(ICorDebugApp
                                                                     ICorDebugFunction *pOldFunction, ICorDebugFunction *pNewFunction, ULONG32 oldILOffset)
 {
     LogFuncEntry();
-    return m_sharedCallbacksQueue->ContinueAppDomain(pAppDomain);
+    const HRESULT remapStatus = m_debugger.TryApplyArmedActiveFrameRemap(
+        pThread,
+        pOldFunction,
+        pNewFunction,
+        oldILOffset);
+    if (remapStatus == S_FALSE)
+        return m_sharedCallbacksQueue->ContinueAppDomain(pAppDomain);
+    if (FAILED(remapStatus))
+        return remapStatus;
+
+    return m_sharedCallbacksQueue->AddCallbackToQueue(pAppDomain, [&]()
+    {
+        pAppDomain->AddRef();
+        pThread->AddRef();
+        m_sharedCallbacksQueue->EmplaceBack(
+            CallbackQueueCall::ActiveFrameRemap,
+            pAppDomain,
+            pThread,
+            nullptr,
+            STEP_NORMAL,
+            ExceptionCallbackType::FIRST_CHANCE);
+    });
 }
 
 HRESULT STDMETHODCALLTYPE ManagedCallback::CreateConnection(ICorDebugProcess *pProcess, CONNID dwConnectionId, WCHAR *pConnName)

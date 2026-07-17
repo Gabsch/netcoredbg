@@ -423,6 +423,7 @@ void ManagedDebuggerBase::NotifyProcessCreated()
 void ManagedDebuggerBase::NotifyProcessExited()
 {
     InvalidateRewindTargets();
+    InvalidateActiveFrameRemapTargets();
     std::unique_lock<std::mutex> lock(m_processAttachedMutex);
     m_processAttachedState = ProcessAttachedState::Unattached;
     lock.unlock();
@@ -450,6 +451,7 @@ void ManagedDebuggerBase::SetLastStoppedThreadId(ThreadId threadId)
         ++m_stoppedEpoch;
     }
     InvalidateRewindTargets();
+    InvalidateActiveFrameRemapTargets();
 
     std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
 
@@ -465,6 +467,14 @@ void ManagedDebuggerBase::InvalidateRewindTargets()
 {
     std::lock_guard<std::mutex> lock(m_rewindTargetsMutex);
     m_rewindTargets.clear();
+}
+
+void ManagedDebuggerBase::InvalidateActiveFrameRemapTargets()
+{
+    std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+    m_activeFrameRemapTargets.clear();
+    m_armedActiveFrameRemapId.clear();
+    m_haveActiveFrameRemapEvent = false;
 }
 
 std::string ManagedDebuggerBase::CurrentStopId()
@@ -605,6 +615,7 @@ HRESULT ManagedDebugger::Disconnect(DisconnectAction action)
 {
     LogFuncEntry();
     InvalidateRewindTargets();
+    InvalidateActiveFrameRemapTargets();
 
     bool terminate;
     switch(action)
@@ -2218,6 +2229,252 @@ HRESULT ManagedDebugger::SetInstructionPointer(
     return S_OK;
 }
 
+HRESULT ManagedDebuggerBase::GetInvocationId(
+    ICorDebugThread *thread,
+    ICorDebugFrame *frame,
+    const IDebugger::RewindFrameIdentity &identity,
+    std::string &invocationId)
+{
+    (void)thread;
+    CORDB_ADDRESS activeStart = 0;
+    CORDB_ADDRESS activeEnd = 0;
+    IfFailRet(frame->GetStackRange(&activeStart, &activeEnd));
+
+    CORDB_ADDRESS callerStart = 0;
+    CORDB_ADDRESS callerEnd = 0;
+    ToRelease<ICorDebugFrame> caller;
+    if (SUCCEEDED(frame->GetCaller(&caller)) && caller)
+        caller->GetStackRange(&callerStart, &callerEnd);
+
+    std::ostringstream material;
+    material << int(identity.threadId) << ':'
+             << identity.moduleMvid << ':'
+             << identity.methodToken << ':'
+             << std::hex << activeStart << ':' << activeEnd << ':' << callerStart << ':' << callerEnd;
+    const std::size_t hash = std::hash<std::string>{}(material.str());
+    std::ostringstream encoded;
+    encoded << "inv_" << std::hex << std::setfill('0') << std::setw(sizeof(std::size_t) * 2) << hash;
+    invocationId = encoded.str();
+    return S_OK;
+}
+
+HRESULT ManagedDebugger::InspectFrameGeneration(
+    ThreadId threadId,
+    FrameId frameId,
+    FrameGenerationEvidence &evidence)
+{
+    std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
+    IfFailRet(CheckDebugProcess());
+    if (m_sharedEvalWaiter->IsEvalRunning() || m_sharedCallbacksQueue->IsRunning())
+        return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+
+    ToRelease<ICorDebugFrame> frame;
+    ToRelease<ICorDebugILFrame> ilFrame;
+    ToRelease<ICorDebugFunction> function;
+    ToRelease<ICorDebugCode> code;
+    ToRelease<ICorDebugModule> module;
+    IfFailRet(GetRewindFrameIdentity(threadId, frameId, evidence.frame, frame, ilFrame, function, code, module));
+    IfFailRet(function->GetCurrentVersionNumber(&evidence.latestGeneration));
+
+    ToRelease<ICorDebugThread> thread;
+    IfFailRet(m_iCorProcess->GetThread(int(threadId), &thread));
+    return GetInvocationId(thread, frame, evidence.frame, evidence.invocationId);
+}
+
+HRESULT ManagedDebugger::ResolveActiveFrameRemapTarget(
+    ThreadId threadId,
+    FrameId frameId,
+    const std::string &sourceFile,
+    int line,
+    const std::string &moduleMvid,
+    uint32_t methodToken,
+    ULONG32 appliedGeneration,
+    ActiveFrameRemapTarget &target)
+{
+    LogFuncEntry();
+    if (sourceFile.empty() || line <= 0 || moduleMvid.empty() || methodToken == 0 || appliedGeneration <= 1)
+        return E_INVALIDARG;
+
+    std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
+    IfFailRet(CheckDebugProcess());
+    if (m_sharedEvalWaiter->IsEvalRunning() || m_sharedCallbacksQueue->IsRunning())
+        return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+
+    ToRelease<ICorDebugFrame> frame;
+    ToRelease<ICorDebugILFrame> ilFrame;
+    ToRelease<ICorDebugFunction> function;
+    ToRelease<ICorDebugCode> code;
+    ToRelease<ICorDebugModule> module;
+    IfFailRet(GetRewindFrameIdentity(threadId, frameId, target.frame, frame, ilFrame, function, code, module));
+    if (target.frame.moduleMvid != moduleMvid || target.frame.methodToken != methodToken)
+    {
+        target.safety = RewindSafety::Unsafe;
+        target.reasonCode = "active_method_mismatch";
+        target.reason = "The applied update does not target the active frame method.";
+        return S_OK;
+    }
+
+    ULONG32 latestGeneration = 0;
+    IfFailRet(function->GetCurrentVersionNumber(&latestGeneration));
+    if (latestGeneration != appliedGeneration || target.frame.functionVersion >= appliedGeneration)
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "applied_generation_mismatch";
+        target.reason = "The active frame and applied update generations could not be correlated.";
+        return S_OK;
+    }
+
+    CORDB_ADDRESS moduleAddress = 0;
+    IfFailRet(module->GetBaseAddress(&moduleAddress));
+    unsigned sourcePathIndex = 0;
+    std::vector<ModulesSources::resolved_bp_t> resolvedPoints;
+    HRESULT Status = m_sharedModules->ResolveBreakpoint(moduleAddress, sourceFile, sourcePathIndex, line, resolvedPoints);
+    if (FAILED(Status))
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "updated_source_not_resolved";
+        target.reason = "The updated entry source line could not be resolved.";
+        return S_OK;
+    }
+
+    const ModulesSources::resolved_bp_t *resolved = nullptr;
+    for (const auto &candidate : resolvedPoints)
+    {
+        std::string candidateMvid;
+        if (candidate.startLine <= line && candidate.endLine >= line &&
+            candidate.methodToken == methodToken &&
+            SUCCEEDED(GetModuleId(candidate.iCorModule, candidateMvid)) &&
+            candidateMvid == moduleMvid)
+        {
+            resolved = &candidate;
+            break;
+        }
+    }
+    if (!resolved)
+    {
+        target.safety = RewindSafety::Unknown;
+        target.reasonCode = "updated_sequence_point_not_found";
+        target.reason = "No updated-generation sequence point matched the entry checkpoint.";
+        return S_OK;
+    }
+
+    ToRelease<ICorDebugThread> thread;
+    IfFailRet(m_iCorProcess->GetThread(int(threadId), &thread));
+    IfFailRet(GetInvocationId(thread, frame, target.frame, target.invocationId));
+    target.requestedLine = line;
+    target.resolvedLine = resolved->startLine;
+    target.targetIlOffset = resolved->ilOffset;
+    target.source = Source(sourceFile);
+    target.appliedGeneration = appliedGeneration;
+    target.safety = RewindSafety::Safe;
+    target.reasonCode = "safe";
+    target.reason = "The target identifies the updated generation of the same active method invocation.";
+    target.targetId = NewRewindTargetId();
+    target.expiresInMs = int(std::chrono::duration_cast<std::chrono::milliseconds>(rewindTargetLifetime).count());
+
+    StoredActiveFrameRemapTarget stored;
+    stored.id = target.targetId;
+    stored.frame = target.frame;
+    stored.sourceFile = sourceFile;
+    stored.resolvedLine = target.resolvedLine;
+    stored.resolvedColumn = target.resolvedColumn;
+    stored.targetIlOffset = target.targetIlOffset;
+    stored.appliedGeneration = appliedGeneration;
+    stored.invocationId = target.invocationId;
+    stored.expiresAt = std::chrono::steady_clock::now() + rewindTargetLifetime;
+    std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+    m_activeFrameRemapTargets.clear();
+    m_activeFrameRemapTargets.emplace(stored.id, std::move(stored));
+    return S_OK;
+}
+
+HRESULT ManagedDebugger::ArmActiveFrameRemap(
+    const std::string &targetId,
+    const RewindFrameIdentity &expectedFrame)
+{
+    std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+    auto found = m_activeFrameRemapTargets.find(targetId);
+    if (found == m_activeFrameRemapTargets.end() || found->second.expiresAt <= std::chrono::steady_clock::now())
+        return E_INVALIDARG;
+    if (!FrameIdentityEquals(found->second.frame, expectedFrame))
+        return E_INVALIDARG;
+    m_armedActiveFrameRemapId = targetId;
+    return S_OK;
+}
+
+HRESULT ManagedDebuggerBase::TryApplyArmedActiveFrameRemap(
+    ICorDebugThread *thread,
+    ICorDebugFunction *oldFunction,
+    ICorDebugFunction *newFunction,
+    ULONG32 oldIlOffset)
+{
+    (void)oldIlOffset;
+    StoredActiveFrameRemapTarget target;
+    {
+        std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+        if (m_armedActiveFrameRemapId.empty())
+            return S_FALSE;
+        auto found = m_activeFrameRemapTargets.find(m_armedActiveFrameRemapId);
+        if (found == m_activeFrameRemapTargets.end())
+            return S_FALSE;
+        target = found->second;
+    }
+
+    mdMethodDef oldToken = 0;
+    mdMethodDef newToken = 0;
+    ToRelease<ICorDebugFunction2> oldFunction2;
+    ToRelease<ICorDebugFunction2> newFunction2;
+    ULONG32 oldGeneration = 0;
+    ULONG32 newGeneration = 0;
+    IfFailRet(oldFunction->GetToken(&oldToken));
+    IfFailRet(newFunction->GetToken(&newToken));
+    IfFailRet(oldFunction->QueryInterface(IID_ICorDebugFunction2, (LPVOID*) &oldFunction2));
+    IfFailRet(newFunction->QueryInterface(IID_ICorDebugFunction2, (LPVOID*) &newFunction2));
+    IfFailRet(oldFunction2->GetVersionNumber(&oldGeneration));
+    IfFailRet(newFunction2->GetVersionNumber(&newGeneration));
+    if (oldToken != target.frame.methodToken || newToken != target.frame.methodToken ||
+        oldGeneration != target.frame.functionVersion || newGeneration != target.appliedGeneration)
+        return E_INVALIDARG;
+
+    ToRelease<ICorDebugFrame> frame;
+    IfFailRet(thread->GetActiveFrame(&frame));
+    ToRelease<ICorDebugILFrame2> ilFrame2;
+    IfFailRet(frame->QueryInterface(IID_ICorDebugILFrame2, (LPVOID*) &ilFrame2));
+    IfFailRet(ilFrame2->RemapFunction(target.targetIlOffset));
+
+    ActiveFrameRemapEvent event;
+    event.targetId = target.id;
+    event.invocationId = target.invocationId;
+    event.moduleMvid = target.frame.moduleMvid;
+    event.methodToken = target.frame.methodToken;
+    event.oldFunctionVersion = oldGeneration;
+    event.newFunctionVersion = newGeneration;
+    event.targetIlOffset = target.targetIlOffset;
+    event.source = Source(target.sourceFile);
+    event.line = target.resolvedLine;
+    {
+        std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+        m_lastActiveFrameRemapEvent = event;
+        m_haveActiveFrameRemapEvent = true;
+        m_activeFrameRemapTargets.clear();
+        m_armedActiveFrameRemapId.clear();
+    }
+    m_sharedVariables->Clear();
+    FrameId::invalidate();
+    InvalidateRewindTargets();
+    return S_OK;
+}
+
+bool ManagedDebuggerBase::TakeActiveFrameRemapEvent(ActiveFrameRemapEvent &event)
+{
+    std::lock_guard<std::mutex> lock(m_activeFrameRemapMutex);
+    if (!m_haveActiveFrameRemapEvent)
+        return false;
+    event = m_lastActiveFrameRemapEvent;
+    m_haveActiveFrameRemapEvent = false;
+    return true;
+}
+
 
 void ManagedDebugger::FindFileNames(string_view pattern, unsigned limit, SearchCallback cb)
 {
@@ -2456,11 +2713,15 @@ HRESULT ManagedDebuggerBase::FindEvalCapableThread(ToRelease<ICorDebugThread> &p
     return E_FAIL;
 }
 
-HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, const std::string &deltaMD, const std::string &deltaIL,
-                                              const std::string &deltaPDB, const std::string &lineUpdates)
+HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, const std::string &moduleMvid,
+                                              const std::vector<uint32_t> &updatedMethodTokens,
+                                              const std::string &deltaMD, const std::string &deltaIL,
+                                              const std::string &deltaPDB, const std::string &lineUpdates,
+                                              std::vector<HotReloadMethodGeneration> &methodGenerations)
 {
     LogFuncEntry();
     InvalidateRewindTargets();
+    InvalidateActiveFrameRemapTargets();
 
     std::lock_guard<Utility::RWLock::Reader> guardProcessRWLock(m_debugProcessRWLock.reader);
 
@@ -2472,7 +2733,32 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
     IfFailRet(m_sharedCallbacksQueue->Stop(m_iCorProcess));
     bool continueProcess = (Status == S_OK); // Was stopped by m_sharedCallbacksQueue->Stop() call.
 
+    ToRelease<ICorDebugModule> module;
+    IfFailRet(m_sharedModules->GetModuleWithName(dllFileName, &module, true));
+    std::string actualMvid;
+    IfFailRet(GetModuleId(module, actualMvid));
+    if (!moduleMvid.empty() && actualMvid != moduleMvid)
+        return E_INVALIDARG;
+
+    methodGenerations.clear();
+    for (uint32_t token : updatedMethodTokens)
+    {
+        ToRelease<ICorDebugFunction> function;
+        ULONG32 previousGeneration = 0;
+        IfFailRet(module->GetFunctionFromToken(token, &function));
+        IfFailRet(function->GetCurrentVersionNumber(&previousGeneration));
+        methodGenerations.push_back({token, previousGeneration, 0});
+    }
+
     IfFailRet(ApplyMetadataAndILDeltas(m_sharedModules.get(), dllFileName, deltaMD, deltaIL));
+    for (auto &generation : methodGenerations)
+    {
+        ToRelease<ICorDebugFunction> function;
+        IfFailRet(module->GetFunctionFromToken(generation.methodToken, &function));
+        IfFailRet(function->GetCurrentVersionNumber(&generation.appliedGeneration));
+        if (generation.appliedGeneration <= generation.previousGeneration)
+            return E_FAIL;
+    }
     std::string updatedDLL;
     std::unordered_set<mdTypeDef> updatedTypeTokens;
     IfFailRet(ApplyPdbDeltaAndLineUpdates(dllFileName, deltaPDB, lineUpdates, updatedDLL, updatedTypeTokens));
@@ -2487,6 +2773,25 @@ HRESULT ManagedDebugger::HotReloadApplyDeltas(const std::string &dllFileName, co
         IfFailRet(m_sharedCallbacksQueue->Continue(m_iCorProcess));
 
     return S_OK;
+}
+
+HRESULT ManagedDebugger::HotReloadApplyDeltas(
+    const std::string &dllFileName,
+    const std::string &deltaMD,
+    const std::string &deltaIL,
+    const std::string &deltaPDB,
+    const std::string &lineUpdates)
+{
+    std::vector<HotReloadMethodGeneration> methodGenerations;
+    return HotReloadApplyDeltas(
+        dllFileName,
+        std::string(),
+        std::vector<uint32_t>(),
+        deltaMD,
+        deltaIL,
+        deltaPDB,
+        lineUpdates,
+        methodGenerations);
 }
 
 } // namespace netcoredbg

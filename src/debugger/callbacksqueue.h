@@ -29,6 +29,7 @@ enum class CallbackQueueCall
     StepComplete,
     Break,
     Exception,
+    ActiveFrameRemap,
     CreateProcess
 #ifdef INTEROP_DEBUGGING
     , InteropBreakpoint
@@ -124,6 +125,7 @@ private:
     bool CallbacksWorkerStepComplete(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread, CorDebugStepReason reason);
     bool CallbacksWorkerBreak(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread);
     bool CallbacksWorkerException(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread, ExceptionCallbackType eventType, const std::string &excModule);
+    bool CallbacksWorkerActiveFrameRemap(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread);
     bool CallbacksWorkerCreateProcess();
     bool HasQueuedCallbacks(ICorDebugProcess *pProcess);
 

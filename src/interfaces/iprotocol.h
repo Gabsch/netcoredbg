@@ -41,6 +41,7 @@ public:
     virtual void EmitModuleEvent(const ModuleEvent &event) = 0;
     virtual void EmitOutputEvent(OutputCategory category, string_view output, string_view source = "", DWORD threadId = 0) = 0;
     virtual void EmitBreakpointEvent(const BreakpointEvent &event) = 0;
+    virtual void EmitVisionActiveFrameRemappedEvent(const ActiveFrameRemapEvent &event) {}
     virtual void Cleanup() = 0;
     virtual void SetLaunchCommand(const std::string &fileExec, const std::vector<std::string> &args) = 0;
     virtual void CommandLoop() = 0;

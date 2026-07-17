@@ -75,6 +75,7 @@ public:
     void EmitModuleEvent(const ModuleEvent &event) override;
     void EmitOutputEvent(OutputCategory category, string_view output, string_view source = "", DWORD threadId = 0) override;
     void EmitBreakpointEvent(const BreakpointEvent &event) override;
+    void EmitVisionActiveFrameRemappedEvent(const ActiveFrameRemapEvent &event) override;
     void Cleanup() override;
     void CommandLoop() override;
 

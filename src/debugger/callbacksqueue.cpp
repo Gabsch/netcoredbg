@@ -156,6 +156,26 @@ bool CallbacksQueue::CallbacksWorkerException(ICorDebugAppDomain *pAppDomain, IC
     return true;
 }
 
+bool CallbacksQueue::CallbacksWorkerActiveFrameRemap(ICorDebugAppDomain *pAppDomain, ICorDebugThread *pThread)
+{
+    ActiveFrameRemapEvent remapEvent;
+    if (!m_debugger.TakeActiveFrameRemapEvent(remapEvent))
+        return false;
+
+    const ThreadId threadId(getThreadId(pThread));
+    m_debugger.SetLastStoppedThread(pThread);
+    m_debugger.pProtocol->EmitVisionActiveFrameRemappedEvent(remapEvent);
+
+    StoppedEvent stopped(StopPause, threadId);
+    stopped.text = "Vision remapped the active frame to an updated method generation.";
+    ToRelease<ICorDebugFrame> frame;
+    if (SUCCEEDED(pThread->GetActiveFrame(&frame)) && frame != nullptr)
+        m_debugger.GetFrameLocation(frame, threadId, FrameLevel(0), stopped.frame, true);
+    m_debugger.pProtocol->EmitStoppedEvent(stopped);
+    m_debugger.m_ioredirect.async_cancel();
+    return true;
+}
+
 bool CallbacksQueue::CallbacksWorkerCreateProcess()
 {
     m_debugger.NotifyProcessCreated();
@@ -190,6 +210,9 @@ void CallbacksQueue::CallbacksWorker()
             break;
         case CallbackQueueCall::Exception:
             m_stopEventInProcess = CallbacksWorkerException(c.iCorAppDomain, c.iCorThread, c.EventType, c.ExcModule);
+            break;
+        case CallbackQueueCall::ActiveFrameRemap:
+            m_stopEventInProcess = CallbacksWorkerActiveFrameRemap(c.iCorAppDomain, c.iCorThread);
             break;
         case CallbackQueueCall::CreateProcess:
             m_stopEventInProcess = CallbacksWorkerCreateProcess();

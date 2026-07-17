@@ -234,6 +234,19 @@ public:
     }
 };
 
+struct ActiveFrameRemapEvent
+{
+    std::string targetId;
+    std::string invocationId;
+    std::string moduleMvid;
+    uint32_t methodToken = 0;
+    ULONG32 oldFunctionVersion = 0;
+    ULONG32 newFunctionVersion = 0;
+    ULONG32 targetIlOffset = 0;
+    Source source;
+    int line = 0;
+};
+
 struct Breakpoint
 {
     uint32_t id;
