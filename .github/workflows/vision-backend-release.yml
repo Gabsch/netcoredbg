@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - "vision/active-frame-remap-v1"
+      - "vision/linux-enc-probe-v1"
     tags:
       - "vision-*"
 
@@ -26,7 +27,7 @@ jobs:
           - runner: ubuntu-24.04
             rid: linux-x64
             executable: payload/netcoredbg
-            hot-reload: "false"
+            hot-reload: "true"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +60,7 @@ jobs:
           cmake -S . -B build -G "Unix Makefiles"
           -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/payload"
           -DCMAKE_BUILD_TYPE=Release
+          -DVISION_ENABLE_EXPERIMENTAL_LINUX_ENC=ON
 
       - name: Build complete backend payload
         run: cmake --build build --config Release --target install --parallel
@@ -107,9 +109,9 @@ jobs:
           Fork commit: $GITHUB_SHA
           Upstream tag: 3.2.0-1092
           Upstream commit: 9744e1f051866215611b8440c638042aa2aa2f72
-          Vision Hot Reload DAP protocol: unavailable
+          Vision Hot Reload DAP protocol: 2
           Vision Instruction Pointer DAP protocol: 1
-          Vision Active Frame Remap DAP protocol: unavailable
+          Vision Active Frame Remap DAP protocol: 1
           EOF
           tar -C payload -czf vision-netcoredbg-linux-x64.tar.gz .
           sha256sum vision-netcoredbg-linux-x64.tar.gz | cut -d ' ' -f 1 > vision-netcoredbg-linux-x64.tar.gz.sha256
