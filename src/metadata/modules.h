@@ -75,6 +75,7 @@ public:
 
     HRESULT GetSourceFullPathByIndex(unsigned index, std::string &fullPath);
     HRESULT GetIndexBySourceFullPath(std::string fullPath, unsigned &index);
+    HRESULT RelocateSourceLine(std::string fullPath, int32_t &line);
     HRESULT ApplyPdbDeltaAndLineUpdates(ICorDebugModule *pModule, bool needJMC, const std::string &deltaPDB,
                                         const std::string &lineUpdates, std::unordered_set<mdMethodDef> &methodTokens);
 

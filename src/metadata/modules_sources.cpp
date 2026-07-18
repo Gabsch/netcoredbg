@@ -360,8 +360,9 @@ HRESULT ModulesSources::FillSourcesCodeLinesForModule(ICorDebugModule *pModule, 
 }
 
 HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsigned fullPathIndex, method_data_t &methodData,
-                                                 const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo)
+                                                 const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo, bool &lineChanged)
 {
+    lineChanged = false;
     int32_t startLineOffset = 0;
     int32_t endLineOffset = 0;
     std::unordered_map<std::size_t, int32_t> methodBlockOffsets;
@@ -450,6 +451,7 @@ HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsig
 
     if (!methodBlockOffsets.empty())
     {
+        lineChanged = true;
         auto findMethod = mdInfo.m_methodBlockUpdates.find(methodData.methodDef);
         assert(findMethod != mdInfo.m_methodBlockUpdates.end());
 
@@ -463,15 +465,17 @@ HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsig
     if (startLineOffset == 0 && endLineOffset == 0)
         return S_OK;
 
+    lineChanged = true;
     methodData.startLine += startLineOffset;
     methodData.endLine += endLineOffset;
     return S_OK;
 }
 
-HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> methodTokens,
+HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> &methodTokens,
                                                         src_block_updates_t &srcBlockUpdates, ModuleInfo &mdInfo)
 {
     std::lock_guard<std::mutex> lock(m_sourcesInfoMutex);
+    m_lastSourceBlockUpdates = srcBlockUpdates;
 
     HRESULT Status;
     std::unique_ptr<module_methods_data_t, module_methods_data_t_deleter> inputData;
@@ -555,7 +559,10 @@ HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule
             tmpFileMethodsData.multiMethodsData.clear();
             for (auto &methodData : tmpMultiMethodsData)
             {
-                IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo));
+                bool lineChanged;
+                IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo, lineChanged));
+                if (lineChanged)
+                    methodTokens.insert(methodData.methodDef);
                 AddMethodData(inputMethodsData, tmpFileMethodsData.multiMethodsData, methodData, 0);
             }
 
@@ -567,7 +574,10 @@ HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule
                     auto findData = inputMetodDefSet.find(methodData.methodDef);
                     if (findData == inputMetodDefSet.end())
                     {
-                        IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo));
+                        bool lineChanged;
+                        IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo, lineChanged));
+                        if (lineChanged)
+                            methodTokens.insert(methodData.methodDef);
                         AddMethodData(inputMethodsData, tmpFileMethodsData.multiMethodsData, methodData, 0);
                     }
                 }
@@ -982,6 +992,35 @@ HRESULT ModulesSources::GetIndexBySourceFullPath(std::string fullPath, unsigned 
 
     index = findIndex->second;
     return S_OK;
+}
+
+HRESULT ModulesSources::RelocateSourceLine(std::string fullPath, int32_t &line)
+{
+#ifdef WIN32
+    HRESULT Status;
+    IfFailRet(Interop::StringToUpper(fullPath));
+#endif
+
+    std::lock_guard<std::mutex> lock(m_sourcesInfoMutex);
+    auto findIndex = m_sourcePathToIndex.find(fullPath);
+    if (findIndex == m_sourcePathToIndex.end())
+        return S_FALSE;
+
+    auto findUpdates = m_lastSourceBlockUpdates.find(findIndex->second);
+    if (findUpdates == m_lastSourceBlockUpdates.end())
+        return S_FALSE;
+
+    for (const auto &update : findUpdates->second)
+    {
+        if (line < update.oldLine ||
+            (uint32_t)line > (uint32_t)update.oldLine + (uint32_t)update.endLineOffset)
+            continue;
+
+        line += update.newLine - update.oldLine;
+        return S_OK;
+    }
+
+    return S_FALSE;
 }
 
 void ModulesSources::FindFileNames(Utility::string_view pattern, unsigned limit, std::function<void(const char *)> cb)

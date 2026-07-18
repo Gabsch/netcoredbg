@@ -91,7 +91,7 @@ jobs:
           Fork commit: $env:GITHUB_SHA
           Upstream tag: 3.2.0-1092
           Upstream commit: 9744e1f051866215611b8440c638042aa2aa2f72
-          Vision Hot Reload DAP protocol: 2
+          Vision Hot Reload DAP protocol: 3
           Vision Instruction Pointer DAP protocol: 1
           Vision Active Frame Remap DAP protocol: 1
           "@ | Set-Content payload/VISION-PROVENANCE.txt -Encoding utf8
@@ -109,7 +109,7 @@ jobs:
           Fork commit: $GITHUB_SHA
           Upstream tag: 3.2.0-1092
           Upstream commit: 9744e1f051866215611b8440c638042aa2aa2f72
-          Vision Hot Reload DAP protocol: 2
+          Vision Hot Reload DAP protocol: 3
           Vision Instruction Pointer DAP protocol: 1
           Vision Active Frame Remap DAP protocol: 1
           EOF

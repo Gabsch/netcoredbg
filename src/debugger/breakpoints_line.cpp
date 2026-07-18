@@ -539,6 +539,10 @@ HRESULT LineBreakpoints::UpdateBreakpointsOnHotReload(ICorDebugModule *pModule, 
     {
         for (auto &initialBreakpoint : initialBreakpoints.second)
         {
+            int32_t relocatedLine = initialBreakpoint.breakpoint.line;
+            if (m_sharedModules->RelocateSourceLine(initialBreakpoints.first, relocatedLine) == S_OK)
+                initialBreakpoint.breakpoint.line = relocatedLine;
+
             int initiallyResolved_linenum = initialBreakpoint.resolved_linenum;
             if (initialBreakpoint.resolved_linenum)
             {

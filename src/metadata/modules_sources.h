@@ -176,6 +176,7 @@ public:
     HRESULT FillSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, PVOID pSymbolReaderHandle);
     HRESULT GetSourceFullPathByIndex(unsigned index, std::string &fullPath);
     HRESULT GetIndexBySourceFullPath(std::string fullPath, unsigned &index);
+    HRESULT RelocateSourceLine(std::string fullPath, int32_t &line);
     HRESULT ApplyPdbDeltaAndLineUpdates(Modules *pModules, ICorDebugModule *pModule, bool needJMC, const std::string &deltaPDB,
                                         const std::string &lineUpdates, std::unordered_set<mdMethodDef> &methodTokens);
 
@@ -205,13 +206,16 @@ private:
     // m_sourcesMethodsData - all methods data indexed by full path, second vector hold data with same full path for different modules,
     //                        since we may have modules with same source full path
     std::vector<std::vector<FileMethodsData>> m_sourcesMethodsData;
+    // Source line movements from the most recently applied Hot Reload update.
+    // Breakpoint rebinding consumes this immediately after PDB application.
+    src_block_updates_t m_lastSourceBlockUpdates;
 
     HRESULT GetFullPathIndex(BSTR document, unsigned &fullPathIndex);
-    HRESULT UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> methodTokens,
+    HRESULT UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> &methodTokens,
                                             src_block_updates_t &blockUpdates, ModuleInfo &mdInfo);
     HRESULT ResolveRelativeSourceFileName(std::string &filename);
     HRESULT LineUpdatesForMethodData(ICorDebugModule *pModule, unsigned fullPathIndex, method_data_t &methodData,
-                                     const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo);
+                                     const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo, bool &lineChanged);
 
 #ifdef WIN32
     // on Windows OS, all files names converted to uppercase in containers above, but this vector hold initial full path names

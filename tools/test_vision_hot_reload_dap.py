@@ -72,7 +72,7 @@ def main():
             capabilities.get("supportsVisionHotReload") is True
         ) == supports_hot_reload, capabilities
         if supports_hot_reload:
-            assert capabilities.get("visionHotReloadProtocolVersion") == 2, capabilities
+            assert capabilities.get("visionHotReloadProtocolVersion") == 3, capabilities
             assert capabilities.get("supportsVisionActiveFrameRemap") is True, capabilities
             assert capabilities.get("visionActiveFrameRemapProtocolVersion") == 1, capabilities
         else:

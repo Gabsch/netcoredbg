@@ -770,6 +770,11 @@ HRESULT Modules::GetIndexBySourceFullPath(std::string fullPath, unsigned &index)
     return m_modulesSources.GetIndexBySourceFullPath(fullPath, index);
 }
 
+HRESULT Modules::RelocateSourceLine(std::string fullPath, int32_t &line)
+{
+    return m_modulesSources.RelocateSourceLine(fullPath, line);
+}
+
 void Modules::FindFileNames(string_view pattern, unsigned limit, std::function<void(const char *)> cb)
 {
     m_modulesSources.FindFileNames(pattern, limit, cb);
