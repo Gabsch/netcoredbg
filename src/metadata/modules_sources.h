@@ -207,11 +207,11 @@ private:
     std::vector<std::vector<FileMethodsData>> m_sourcesMethodsData;
 
     HRESULT GetFullPathIndex(BSTR document, unsigned &fullPathIndex);
-    HRESULT UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> methodTokens,
+    HRESULT UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> &methodTokens,
                                             src_block_updates_t &blockUpdates, ModuleInfo &mdInfo);
     HRESULT ResolveRelativeSourceFileName(std::string &filename);
     HRESULT LineUpdatesForMethodData(ICorDebugModule *pModule, unsigned fullPathIndex, method_data_t &methodData,
-                                     const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo);
+                                     const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo, bool &lineChanged);
 
 #ifdef WIN32
     // on Windows OS, all files names converted to uppercase in containers above, but this vector hold initial full path names

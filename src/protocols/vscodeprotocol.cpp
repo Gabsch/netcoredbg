@@ -58,7 +58,7 @@ namespace
         "initialize", "setExceptionBreakpoints", "configurationDone", "setBreakpoints", "launch", "disconnect", "terminate", "attach", "setFunctionBreakpoints",
         "visionApplyHotReload"};
 
-    constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 2;
+    constexpr int VISION_HOT_RELOAD_PROTOCOL_VERSION = 3;
     constexpr int VISION_INSTRUCTION_POINTER_PROTOCOL_VERSION = 1;
     constexpr int VISION_ACTIVE_FRAME_REMAP_PROTOCOL_VERSION = 1;
 

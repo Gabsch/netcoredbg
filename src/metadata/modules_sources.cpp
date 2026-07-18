@@ -360,8 +360,9 @@ HRESULT ModulesSources::FillSourcesCodeLinesForModule(ICorDebugModule *pModule, 
 }
 
 HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsigned fullPathIndex, method_data_t &methodData,
-                                                 const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo)
+                                                 const std::vector<block_update_t> &blockUpdate, ModuleInfo &mdInfo, bool &lineChanged)
 {
+    lineChanged = false;
     int32_t startLineOffset = 0;
     int32_t endLineOffset = 0;
     std::unordered_map<std::size_t, int32_t> methodBlockOffsets;
@@ -450,6 +451,7 @@ HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsig
 
     if (!methodBlockOffsets.empty())
     {
+        lineChanged = true;
         auto findMethod = mdInfo.m_methodBlockUpdates.find(methodData.methodDef);
         assert(findMethod != mdInfo.m_methodBlockUpdates.end());
 
@@ -463,12 +465,13 @@ HRESULT ModulesSources::LineUpdatesForMethodData(ICorDebugModule *pModule, unsig
     if (startLineOffset == 0 && endLineOffset == 0)
         return S_OK;
 
+    lineChanged = true;
     methodData.startLine += startLineOffset;
     methodData.endLine += endLineOffset;
     return S_OK;
 }
 
-HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> methodTokens,
+HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule, IMetaDataImport *pMDImport, std::unordered_set<mdMethodDef> &methodTokens,
                                                         src_block_updates_t &srcBlockUpdates, ModuleInfo &mdInfo)
 {
     std::lock_guard<std::mutex> lock(m_sourcesInfoMutex);
@@ -555,7 +558,10 @@ HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule
             tmpFileMethodsData.multiMethodsData.clear();
             for (auto &methodData : tmpMultiMethodsData)
             {
-                IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo));
+                bool lineChanged;
+                IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo, lineChanged));
+                if (lineChanged)
+                    methodTokens.insert(methodData.methodDef);
                 AddMethodData(inputMethodsData, tmpFileMethodsData.multiMethodsData, methodData, 0);
             }
 
@@ -567,7 +573,10 @@ HRESULT ModulesSources::UpdateSourcesCodeLinesForModule(ICorDebugModule *pModule
                     auto findData = inputMetodDefSet.find(methodData.methodDef);
                     if (findData == inputMetodDefSet.end())
                     {
-                        IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo));
+                        bool lineChanged;
+                        IfFailRet(LineUpdatesForMethodData(pModule, fullPathIndex, methodData, updateData.second.blockUpdate, mdInfo, lineChanged));
+                        if (lineChanged)
+                            methodTokens.insert(methodData.methodDef);
                         AddMethodData(inputMethodsData, tmpFileMethodsData.multiMethodsData, methodData, 0);
                     }
                 }
