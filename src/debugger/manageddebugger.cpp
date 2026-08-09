@@ -56,6 +56,7 @@
 #include "utils/logger.h"
 #include "debugger/waitpid.h"
 #include "utils/iosystem.h"
+#include "utils/filesystem.h"
 
 #ifdef INTEROP_DEBUGGING
 #include "elf++.h"
@@ -928,11 +929,20 @@ static void SetCustomEnvironmentArgs(std::map<std::string, std::string> &env, bo
 #ifdef NCDB_DOTNET_STARTUP_HOOK
     if (hotReload)
     {
+        std::string startupHook = NCDB_DOTNET_STARTUP_HOOK;
+        if (!IsFullPath(startupHook))
+        {
+            std::string executablePath = GetExeAbsPath();
+            size_t separator = executablePath.find_last_of(FileSystem::PathSeparatorSymbols);
+            if (separator != std::string::npos)
+                startupHook = executablePath.substr(0, separator + 1) + startupHook;
+        }
+
         auto find = env.find(envDOTNET_STARTUP_HOOKS);
         if (find != env.end())
-            find->second = find->second + delimiterDOTNET_STARTUP_HOOKS + NCDB_DOTNET_STARTUP_HOOK;
+            find->second = find->second + delimiterDOTNET_STARTUP_HOOKS + startupHook;
         else
-            env[envDOTNET_STARTUP_HOOKS] = NCDB_DOTNET_STARTUP_HOOK;
+            env[envDOTNET_STARTUP_HOOKS] = startupHook;
     }
 #else
     (void)hotReload; // suppress warning about unused param
